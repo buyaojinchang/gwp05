@@ -1,0 +1,19 @@
+# @package _global_
+#
+# GWP-V0 AgileX MoT training on heat_food + fold_shirt (joint video+action).
+# Base task for the gwp_v0 heat_food/fold_shirt family.
+
+defaults:
+  - override /data: gwp_v0_agilex_tshape
+  - override /model: mot
+  - _self_
+
+exp_name: gwp_v0_heat_food_fold_shirt_mot
+
+optimizers:
+  lr: 4.0e-5
+
+model:
+  pretrained: ${oc.env:WAN22_DIFFUSERS_PATH,/shared_disk/users/xuancheng.xu/models/Wan2.2-TI2V-5B-step11000-diffusers}
+  freeze_action: false
+  use_gt_action_for_video: false

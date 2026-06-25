@@ -95,7 +95,16 @@ class LeRobotDataset(Dataset):
             ep_idx = int(df["episode_index"].iloc[0]) if "episode_index" in df.columns else len(self.episodes)
 
             actions = np.stack(df["action"].values).astype(np.float32)
-            states = np.stack(df["observation.state"].values).astype(np.float32)
+            states = (
+                np.stack(df["observation.state"].values).astype(np.float32)
+                if "observation.state" in df.columns
+                else None
+            )
+            motion_latents = (
+                np.stack(df["observation.motion_latent"].values).astype(np.float32)
+                if "observation.motion_latent" in df.columns
+                else None
+            )
 
             rel = os.path.relpath(pf, data_dir)
             chunk = os.path.dirname(rel)
@@ -117,6 +126,7 @@ class LeRobotDataset(Dataset):
                     "length": len(df),
                     "actions": actions,
                     "states": states,
+                    "motion_latents": motion_latents,
                     "chunk": chunk,
                     "name": ep_name,
                     "task_index": task_index,
@@ -328,7 +338,12 @@ class LeRobotDataset(Dataset):
 
         end = start + self.action_horizon
         data_dict["action"] = torch.from_numpy(ep["actions"][start:end].copy())
-        data_dict["observation.state"] = torch.from_numpy(ep["states"][start : start + 1].copy())
+        if ep.get("states") is not None:
+            data_dict["observation.state"] = torch.from_numpy(ep["states"][start : start + 1].copy())
+        if ep.get("motion_latents") is not None:
+            data_dict["observation.motion_latent"] = torch.from_numpy(
+                ep["motion_latents"][start : start + 1].copy()
+            )
 
         t5_embed = ep.get("t5_embed")
         if t5_embed is None:

@@ -1,0 +1,68 @@
+# GWP-V0 AgileX (cobot magic) real-robot T-shape LeRobot data.
+#
+# T-shape layout: cam_high 320x256 on top, two wrist views 160x128 each on
+# bottom. Final image 320w x 384h, all dims /16.
+# NOTE: dst_size is (width, height) per WATransformsLerobot convention.
+#
+# layout=task_list -> one LeRobot dir per entry in `task_names`
+# (data_root/<task_name>).
+
+layout: task_list
+data_root: ${oc.env:GWP_V0_DATA_ROOT,/shared_disk/users/hengtao.li/giga_real_data/gwp_v0}
+task_names:
+  - heat_food
+  - fold_shirt
+norm_path: ${data.data_root}/norm_stats_delta.json
+
+# optional dataloader knobs (forwarded only when non-null)
+sample_timeout_sec: null
+max_sample_retries: null
+timeout: null
+prefetch_factor: null
+persistent_workers: null
+
+num_frames: 36
+action_dim: 14
+state_dim: 14
+dst_size: [320, 256]
+
+view_keys:
+  - observation.images.cam_high
+  - observation.images.cam_left_wrist
+  - observation.images.cam_right_wrist
+
+batch_size_per_gpu: 8
+num_workers: 8
+
+dataset:
+  class_name: LeRobotDataset
+  video_backend: ${oc.env:LEROBOT_VIDEO_BACKEND,pyav}
+  robotype: agilex_cobot_magic
+
+transform:
+  type: WATransformsLerobot
+  dst_size: ${data.dst_size}
+  num_frames: ${data.num_frames}
+  is_train: true
+  norm_path: ${data.norm_path}
+  model_action_dim: ${data.action_dim}
+  model_state_dim: ${data.state_dim}
+  num_views: 3
+  view_keys: ${data.view_keys}
+  t5_len: 64
+  robotype_to_embed_id:
+    aloha: 0
+    agilex: 0
+    agilex_cobot_magic: 0
+    w1: 0
+    arx5: 0
+    ur5: 3
+    robocasa: 2
+  image_cfg:
+    mask_generator:
+      max_ref_frames: 1
+      start: 1
+      factor: 4
+  skip_action_norm: false
+  tshape: true
+  tshape_head_index: 0          # cam_high as head (full size)

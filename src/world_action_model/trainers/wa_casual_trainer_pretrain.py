@@ -18,6 +18,7 @@ class CasualWATrainerPretrain(CasualWATrainer):
         timestep, sigma = self.get_timestep_and_sigma(images.shape[0], images.ndim)
         action = batch_dict["action"]
         state = batch_dict["state"]
+        state_mask = batch_dict.get("state_mask", None)
 
         # Independent sigma for action branch (with its own flow_shift)
         # action shape: (bs, T, D), need sigma (bs, 1, 1) for broadcasting
@@ -119,6 +120,7 @@ class CasualWATrainerPretrain(CasualWATrainer):
             return_dict=False,
             action=input_action,
             state=state,
+            state_mask=state_mask,
         )
 
         # --- Visualization ---

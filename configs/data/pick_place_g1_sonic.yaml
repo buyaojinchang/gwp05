@@ -1,0 +1,77 @@
+# Locomanip "pick_place" (G1 cola pick-and-throw, 110 episodes) for gwp-mot.
+#
+# Action target: 66-d sonic latent (motion_token[64] + hand_binary[2]).
+# State target is a 2-token sequence:
+#   token0 = raw 43-d joint state, z-score normalized
+#   token1 = raw 66-d sonic latent, kept unnormalized
+#
+# IMPORTANT: gwp-mot's LeRobotDataset hardcodes the parquet columns `action` and
+# `observation.state`. The raw pick_place parquet instead stores
+# `action.motion_token` / `action.hand_binary`, so it must be pre-processed once:
+#
+#   python scripts/prepare_pick_place_gwp.py
+#
+# That script writes a sibling dataset `pick_place_gwp/` (parquet with `action`
+# `observation.state` set to 43-d joints and `observation.motion_latent` set to
+# the 66-d latent, videos/meta symlinked) plus `norm_stats_delta.json`.
+# This config points at that prepared dir.
+#
+# Video / action are both 50 Hz and frame-aligned (ego_view 50fps), so no
+# fps resampling is needed: gwp-mot samples 5 video frames spanning the action
+# window [0, num_frames] and an action chunk of `num_frames` steps at the same
+# indices.
+
+layout: task_list
+data_root: ${oc.env:PICK_PLACE_ROOT,/home/s4090/hengtao.li/2_data_ckpt_cache/locomanip/data}
+task_names:
+  - pick_place_gwp
+norm_path: ${data.data_root}/pick_place_gwp/norm_stats_delta.json
+
+num_frames: 56
+action_dim: 66               # sonic latent: motion_token(64) + hand_binary(2)
+state_dim: 66                # padded per-token state width; max(43 joint, 66 latent)
+joint_state_dim: 43
+latent_state_dim: 66
+state_token_dims: [43, 66]
+num_state_tokens: 2
+dst_size: [320, 256]         # (width, height); common 5:4 crop, divisible by 32
+
+view_keys:
+  - observation.images.ego_view
+
+batch_size_per_gpu: 4
+num_workers: 8
+
+dataset:
+  class_name: LeRobotDataset
+  video_backend: pyav
+  robotype: g1_sonic
+
+transform:
+  type: WATransformsLerobot
+  dst_size: ${data.dst_size}
+  num_frames: ${data.num_frames}
+  is_train: true
+  norm_path: ${data.norm_path}
+  model_action_dim: ${data.action_dim}
+  model_state_dim: ${data.state_dim}
+  state_keys:
+    - observation.state
+    - observation.motion_latent
+  state_token_dims: ${data.state_token_dims}
+  state_norm_keys:
+    - observation.state
+    - observation.motion_latent
+  num_views: 1
+  view_keys: ${data.view_keys}
+  t5_len: 64
+  robotype_to_embed_id:
+    g1_sonic: 3                # -> delta template 3 (66-d, no delta, all dims real)
+  image_cfg:
+    mask_generator:
+      max_ref_frames: 1
+      start: 1
+      factor: 4
+  skip_action_norm: true       # sonic latent already in [-1, 1]; keep it raw
+  tshape: false                # single ego_view, no T-shape layout
+  resize_mode: crop            # fixed-scale cover crop: train random shift, eval center crop

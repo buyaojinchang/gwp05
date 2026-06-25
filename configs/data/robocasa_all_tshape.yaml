@@ -1,0 +1,59 @@
+# RoboCasa T-shape LeRobot data (all atomic + composite tasks).
+#
+# T-shape layout: head view (agentview_right) 320w x 256h on top, two wrist
+# views 160w x 128h each on bottom. Final image 384h x 320w, all dims /16.
+# NOTE: dst_size is (width, height) per WATransformsLerobot convention.
+#
+# The concrete per-episode `data_or_config` list is expanded at load time by
+# scanning `data_root` over `categories` (optionally filtered by `task_filter`).
+
+layout: scan                 # scan data_root/<category>/<task>/<date>/lerobot
+data_root: ${oc.env:ROBOCASA_DATA_ROOT,/shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain_gwp}
+categories:
+  - atomic
+  - composite
+task_filter: null            # null | atomic_seen
+norm_path: ${data.data_root}/norm_stats_delta.json
+
+num_frames: 24
+action_dim: 12               # robocasa PandaOmron action is 12d
+state_dim: 16                # robocasa PandaOmron state is 16d
+dst_size: [320, 256]
+
+view_keys:
+  - observation.images.robot0_agentview_left
+  - observation.images.robot0_eye_in_hand
+  - observation.images.robot0_agentview_right
+
+batch_size_per_gpu: 8
+num_workers: 8
+
+# template applied to every scanned lerobot dir
+dataset:
+  class_name: LeRobotDataset
+  video_backend: pyav
+  robotype: robocasa
+
+transform:
+  type: WATransformsLerobot
+  dst_size: ${data.dst_size}
+  num_frames: ${data.num_frames}
+  is_train: true
+  norm_path: ${data.norm_path}
+  model_action_dim: ${data.action_dim}
+  model_state_dim: ${data.state_dim}
+  num_views: 3
+  view_keys: ${data.view_keys}
+  t5_len: 64
+  robotype_to_embed_id:
+    aloha: 0
+    agilex: 0
+    robocasa: 2
+  image_cfg:
+    mask_generator:
+      max_ref_frames: 1
+      start: 1
+      factor: 4
+  skip_action_norm: false
+  tshape: true
+  tshape_head_index: 2         # agentview_right as head (full size)

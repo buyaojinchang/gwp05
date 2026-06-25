@@ -19,9 +19,20 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 def collect_all_tasks(data_root: str) -> dict[str, list[dict]]:
     """Collect all (lerobot_path, task_descriptions) pairs."""
     result = {}
-    for tasks_file in sorted(
-        glob.glob(os.path.join(data_root, "**", "lerobot", "meta", "tasks.jsonl"), recursive=True)
-    ):
+    patterns = [
+        os.path.join(data_root, "**", "lerobot", "meta", "tasks.jsonl"),
+        os.path.join(data_root, "**", "meta", "tasks.jsonl"),
+    ]
+    tasks_files = []
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            path = os.path.abspath(path)
+            if path not in seen:
+                seen.add(path)
+                tasks_files.append(path)
+
+    for tasks_file in sorted(tasks_files):
         lerobot_dir = os.path.dirname(os.path.dirname(tasks_file))
         tasks = []
         with open(tasks_file) as f:

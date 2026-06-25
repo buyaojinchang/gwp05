@@ -66,12 +66,45 @@ def _install_process_group_timeout(timeout_sec) -> None:
 
 
 class EMA:
-    """FP32 EMA for trainable floating point parameters."""
+    """FP32 EMA for trainable floating point parameters.
 
-    def __init__(self, model: nn.Module, decay: float = 0.995, device: str | torch.device | None = None):
+    Supports an optional step-adaptive (dynamic) decay schedule. With
+    ``dynamic=False`` the behaviour is the classic constant-``decay`` EMA. With
+    ``dynamic=True`` the per-step decay ramps up from ``min_decay`` toward
+    ``decay`` so early shadow weights track the model quickly instead of being
+    anchored to the (noisy) initial weights:
+
+    - default schedule:      ``decay_t = (1 + t) / (10 + t)``
+    - inv-gamma (diffusers): ``decay_t = 1 - (1 + t / inv_gamma) ** -power``
+
+    where ``t = max(0, step - update_after_step - 1)`` and the result is clamped
+    to ``[min_decay, decay]``. ``step`` is the running EMA update count, so the
+    schedule resumes correctly from a restored checkpoint.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.995,
+        device: str | torch.device | None = None,
+        *,
+        dynamic: bool = False,
+        min_decay: float = 0.0,
+        update_after_step: int = 0,
+        use_ema_warmup: bool = False,
+        inv_gamma: float = 1.0,
+        power: float = 2.0 / 3.0,
+    ):
         self.decay = float(decay)
         self.device = torch.device(device) if device and str(device) != "model" else None
+        self.dynamic = bool(dynamic)
+        self.min_decay = float(min_decay)
+        self.update_after_step = int(update_after_step)
+        self.use_ema_warmup = bool(use_ema_warmup)
+        self.inv_gamma = float(inv_gamma)
+        self.power = float(power)
         self.updates = 0
+        self.last_decay = 0.0 if self.dynamic else self.decay
         self.shadow: dict[str, torch.Tensor] = {}
         self._backup: dict[str, torch.Tensor] = {}
         self._init_shadow(model)
@@ -89,17 +122,32 @@ class EMA:
     def tracked_names(self) -> set[str]:
         return set(self.shadow.keys())
 
+    def get_decay(self, step: int) -> float:
+        """Step-adaptive decay clamped to ``[min_decay, decay]``."""
+        if not self.dynamic:
+            return self.decay
+        t = max(0, int(step) - self.update_after_step - 1)
+        if t <= 0:
+            return 0.0
+        if self.use_ema_warmup:
+            cur = 1.0 - (1.0 + t / self.inv_gamma) ** (-self.power)
+        else:
+            cur = (1.0 + t) / (10.0 + t)
+        return max(self.min_decay, min(cur, self.decay))
+
     def update(self, model: nn.Module):
         if not self.shadow:
             self._init_shadow(model)
+        decay = self.get_decay(self.updates)
+        self.last_decay = decay
         with torch.no_grad():
             for name, param in model.named_parameters():
                 shadow = self.shadow.get(name)
                 if shadow is None:
                     continue
-                shadow.mul_(self.decay).add_(
+                shadow.mul_(decay).add_(
                     param.detach().float().to(device=shadow.device),
-                    alpha=1.0 - self.decay,
+                    alpha=1.0 - decay,
                 )
         self.updates += 1
 
@@ -111,6 +159,12 @@ class EMA:
         return {
             "decay": self.decay,
             "updates": self.updates,
+            "dynamic": self.dynamic,
+            "min_decay": self.min_decay,
+            "update_after_step": self.update_after_step,
+            "use_ema_warmup": self.use_ema_warmup,
+            "inv_gamma": self.inv_gamma,
+            "power": self.power,
             "shadow": shadow,
         }
 
@@ -119,6 +173,12 @@ class EMA:
             shadow_state = state_dict.get("shadow", {})
             self.decay = float(state_dict.get("decay", self.decay))
             self.updates = int(state_dict.get("updates", self.updates))
+            self.dynamic = bool(state_dict.get("dynamic", self.dynamic))
+            self.min_decay = float(state_dict.get("min_decay", self.min_decay))
+            self.update_after_step = int(state_dict.get("update_after_step", self.update_after_step))
+            self.use_ema_warmup = bool(state_dict.get("use_ema_warmup", self.use_ema_warmup))
+            self.inv_gamma = float(state_dict.get("inv_gamma", self.inv_gamma))
+            self.power = float(state_dict.get("power", self.power))
         else:
             shadow_state = state_dict
 
@@ -437,12 +497,34 @@ class Trainer:
         ema_device = ema_cfg.get("device", train_cfg.get("ema_device", "model"))
 
         unwrapped = self.accelerator.unwrap_model(self.model)
-        ema = EMA(unwrapped, decay=ema_decay, device=ema_device) if with_ema else None
-        if self.process_index == 0 and ema is not None:
-            print(
-                f"EMA enabled: decay={ema.decay}, device={ema_device}, "
-                f"tracked={len(ema.shadow)} trainable floating tensors"
+        ema = (
+            EMA(
+                unwrapped,
+                decay=ema_decay,
+                device=ema_device,
+                dynamic=bool(ema_cfg.get("dynamic", False)),
+                min_decay=float(ema_cfg.get("min_decay", 0.0)),
+                update_after_step=int(ema_cfg.get("update_after_step", 0)),
+                use_ema_warmup=bool(ema_cfg.get("use_ema_warmup", False)),
+                inv_gamma=float(ema_cfg.get("inv_gamma", 1.0)),
+                power=float(ema_cfg.get("power", 2.0 / 3.0)),
             )
+            if with_ema
+            else None
+        )
+        if self.process_index == 0 and ema is not None:
+            if ema.dynamic:
+                sched = "inv_gamma" if ema.use_ema_warmup else "step_ratio"
+                print(
+                    f"EMA enabled: dynamic decay ({sched}) -> [{ema.min_decay}, {ema.decay}], "
+                    f"update_after_step={ema.update_after_step}, device={ema_device}, "
+                    f"tracked={len(ema.shadow)} trainable floating tensors"
+                )
+            else:
+                print(
+                    f"EMA enabled: decay={ema.decay}, device={ema_device}, "
+                    f"tracked={len(ema.shadow)} trainable floating tensors"
+                )
 
         if self.process_index == 0:
             wandb_cfg = self.config.get("wandb", {})
@@ -506,6 +588,7 @@ class Trainer:
                     log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
                     if ema is not None:
                         log_dict["ema/updates"] = ema.updates
+                        log_dict["ema/decay"] = ema.last_decay
                     postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
                     wandb.log(log_dict, step=self.cur_step)
                     if pbar is not None:

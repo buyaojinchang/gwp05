@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -63,6 +63,7 @@ class ActionStateDiT(nn.Module):
         self,
         action_dim: int,
         state_dim: int,
+        state_token_dims: Optional[Sequence[int]] = None,
         hidden_dim: int = 1024,
         ffn_dim: int = 4096,
         text_dim: int = 4096,
@@ -76,6 +77,7 @@ class ActionStateDiT(nn.Module):
         super().__init__()
         self.action_dim = int(action_dim)
         self.state_dim = int(state_dim)
+        self.state_token_dims = [int(x) for x in state_token_dims] if state_token_dims is not None else None
         self.hidden_dim = int(hidden_dim)
         self.ffn_dim = int(ffn_dim)
         self.text_dim = int(text_dim)
@@ -84,13 +86,31 @@ class ActionStateDiT(nn.Module):
         self.attn_head_dim = int(attn_head_dim)
         self.num_layers = int(num_layers)
 
-        self.state_encoder = nn.Sequential(
-            nn.Linear(self.state_dim, 128),
-            nn.GELU(),
-            nn.Linear(128, 256),
-            nn.GELU(),
-            nn.Linear(256, self.hidden_dim),
-        )
+        def _make_state_encoder(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(in_dim), 128),
+                nn.GELU(),
+                nn.Linear(128, 256),
+                nn.GELU(),
+                nn.Linear(256, self.hidden_dim),
+            )
+
+        if self.state_token_dims is None:
+            self.state_encoder = _make_state_encoder(self.state_dim)
+            self.state_type_embed = None
+        else:
+            if len(self.state_token_dims) == 0:
+                raise ValueError("state_token_dims must be non-empty when provided")
+            names = ["joint", "latent"] + [f"extra_{i}" for i in range(max(0, len(self.state_token_dims) - 2))]
+            self.state_encoder = nn.ModuleDict(
+                {
+                    names[i]: _make_state_encoder(dim)
+                    for i, dim in enumerate(self.state_token_dims)
+                }
+            )
+            self.state_type_embed = nn.Parameter(torch.zeros(1, len(self.state_token_dims), self.hidden_dim))
+            nn.init.normal_(self.state_type_embed, mean=0.0, std=0.02)
+
         self.action_encoder = nn.Sequential(
             nn.Linear(self.action_dim, 128),
             nn.GELU(),
@@ -126,6 +146,55 @@ class ActionStateDiT(nn.Module):
             ]
         )
 
+    @property
+    def joint_encoder(self) -> Optional[nn.Module]:
+        if isinstance(self.state_encoder, nn.ModuleDict) and "joint" in self.state_encoder:
+            return self.state_encoder["joint"]
+        return None
+
+    @property
+    def latent_encoder(self) -> Optional[nn.Module]:
+        if isinstance(self.state_encoder, nn.ModuleDict) and "latent" in self.state_encoder:
+            return self.state_encoder["latent"]
+        return None
+
+    @staticmethod
+    def _pad_or_truncate_last(x: torch.Tensor, dim: int) -> torch.Tensor:
+        if x.shape[-1] > dim:
+            return x[..., :dim]
+        if x.shape[-1] < dim:
+            return torch.nn.functional.pad(x, (0, dim - int(x.shape[-1])), value=0.0)
+        return x
+
+    def _encode_state_tokens(
+        self,
+        state: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.state_token_dims is None:
+            state_tokens = self.state_encoder(state)
+        else:
+            if state.shape[1] != len(self.state_token_dims):
+                raise ValueError(
+                    f"Expected {len(self.state_token_dims)} state tokens, got {state.shape[1]}"
+                )
+            encoded = []
+            for idx, (name, dim) in enumerate(zip(self.state_encoder.keys(), self.state_token_dims)):
+                token = self._pad_or_truncate_last(state[:, idx], dim)
+                encoded.append(self.state_encoder[name](token).unsqueeze(1))
+            state_tokens = torch.cat(encoded, dim=1)
+            state_tokens = state_tokens + self.state_type_embed.to(device=state_tokens.device, dtype=state_tokens.dtype)
+
+        if state_mask is not None:
+            if state_mask.ndim == 1:
+                state_mask = state_mask[None, :].expand(state_tokens.shape[0], -1)
+            if tuple(state_mask.shape) != tuple(state_tokens.shape[:2]):
+                raise ValueError(
+                    f"Expected state_mask shape {tuple(state_tokens.shape[:2])}, got {tuple(state_mask.shape)}"
+                )
+            state_tokens = state_tokens * state_mask.to(device=state_tokens.device, dtype=state_tokens.dtype).unsqueeze(-1)
+        return state_tokens
+
     def _embed_token_timesteps(
         self,
         timestep: torch.Tensor,
@@ -160,6 +229,7 @@ class ActionStateDiT(nn.Module):
         state_timestep: torch.Tensor,
         action_timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         if state.ndim != 3:
             raise ValueError(f"state must be [B,S,D], got {tuple(state.shape)}")
@@ -169,7 +239,7 @@ class ActionStateDiT(nn.Module):
             raise ValueError(f"state/action batch mismatch: {state.shape[0]} vs {action.shape[0]}")
 
         batch_size = state.shape[0]
-        state_tokens = self.state_encoder(state)
+        state_tokens = self._encode_state_tokens(state, state_mask=state_mask)
         action_tokens = self.action_encoder(action)
         tokens = torch.cat([state_tokens, action_tokens], dim=1)
 

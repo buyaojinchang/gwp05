@@ -28,6 +28,9 @@ class WATransformsLerobot(WATransforms):
         num_views=1,
         view_keys=None,
         state_key="observation.state",
+        state_keys=None,
+        state_token_dims=None,
+        state_norm_keys=None,
         action_key="action",
         task_key="task",
         t5_len=64,
@@ -78,6 +81,23 @@ class WATransformsLerobot(WATransforms):
             ]
         self.view_keys = list(view_keys)
         self.state_key = state_key
+        self.state_keys = list(state_keys) if state_keys is not None else [state_key]
+        if state_token_dims is None:
+            self.state_token_dims = None
+        else:
+            self.state_token_dims = [int(x) for x in state_token_dims]
+            if len(self.state_token_dims) != len(self.state_keys):
+                raise ValueError(
+                    f"state_token_dims length {len(self.state_token_dims)} must match "
+                    f"state_keys length {len(self.state_keys)}"
+                )
+        self.state_norm_keys = list(state_norm_keys) if state_norm_keys is not None else list(self.state_keys)
+        if len(self.state_norm_keys) != len(self.state_keys):
+            raise ValueError(
+                f"state_norm_keys length {len(self.state_norm_keys)} must match "
+                f"state_keys length {len(self.state_keys)}"
+            )
+        self.multi_state_mode = len(self.state_keys) > 1
         self.action_key = action_key
         self.task_key = task_key
         self.t5_len = int(t5_len)
@@ -170,8 +190,12 @@ class WATransformsLerobot(WATransforms):
                 new_height = dst_height
                 new_width = int(round(float(dst_height) / height * width))
             input_images = F.resize(input_images, (new_height, new_width), InterpolationMode.BILINEAR)
-            x1 = random.randint(0, new_width - dst_width)
-            y1 = random.randint(0, new_height - dst_height)
+            if self.is_train:
+                x1 = random.randint(0, new_width - dst_width)
+                y1 = random.randint(0, new_height - dst_height)
+            else:
+                x1 = (new_width - dst_width) // 2
+                y1 = (new_height - dst_height) // 2
             input_images = F.crop(input_images, y1, x1, dst_height, dst_width)
         if self.is_train and self.random_shift_pad > 0:
             max_pad = min(self.random_shift_pad, (dst_width - 1) // 4, (dst_height - 1) // 4)
@@ -250,19 +274,9 @@ class WATransformsLerobot(WATransforms):
         action = data_dict[self.action_key]
         if isinstance(action, np.ndarray):
             action = torch.from_numpy(action)
-        state = data_dict[self.state_key]
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state)
-
         action = action.to(dtype=torch.float32)
-        state = state.to(dtype=torch.float32)
-
         if action.dim() == 1:
             action = action[None, :]
-        if state.dim() == 1:
-            state = state[None, :]
-        if state.dim() == 2 and state.shape[0] > 1:
-            state = state[:1]
 
         if action.shape[0] != self.num_frames:
             t = int(self.num_frames)
@@ -277,35 +291,24 @@ class WATransformsLerobot(WATransforms):
         ad = int(self.model_action_dim)
         sd = int(self.model_state_dim) if self.model_state_dim is not None else ad
 
-        # Pad / truncate action to model_action_dim
-        if action.shape[-1] > ad:
-            action = action[..., :ad]
-        if action.shape[-1] < ad:
-            action = torch_F.pad(action, (0, ad - int(action.shape[-1])), value=0.0)
+        def _pad_truncate_last(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+            if x.shape[-1] > target_dim:
+                return x[..., :target_dim]
+            if x.shape[-1] < target_dim:
+                return torch_F.pad(x, (0, target_dim - int(x.shape[-1])), value=0.0)
+            return x
 
-        # Pad / truncate state to model_state_dim
-        if state.shape[-1] > sd:
-            state = state[..., :sd]
-        if state.shape[-1] < sd:
-            state = torch_F.pad(state, (0, sd - int(state.shape[-1])), value=0.0)
-
-        # Delta mask templates — only used when action_dim == state_dim (dims semantically aligned)
-        delta_mask_templates = {
-            0: np.array([True, True, True, True, True, True, False, True, True, True, True, True, True, False], dtype=bool),
-            1: np.array([True, True, True, True, True, True, True, False, True, True, True, True, True, True, True, False], dtype=bool),
-            2: np.array([False] * 16, dtype=bool),  # robocasa PandaOmron: action is already delta-like
-        }
-        base = delta_mask_templates.get(robotype_embed_id, None)
-        assert base is not None, f"robotype_embed_id {robotype_embed_id} not found in delta_mask_templates"
-
-        # Delta: action - state (only when dims match and mask is True)
-        delta = action.clone()
-        if ad == sd:
-            mask = base[:ad] if len(base) >= ad else np.pad(base, (0, ad - len(base)), constant_values=False)
-            mask_t = torch.as_tensor(mask, dtype=torch.bool, device=action.device)
-            idx = torch.nonzero(mask_t, as_tuple=False).flatten()
-            if idx.numel() > 0:
-                delta[:, idx] = action[:, idx] - state[:, idx]
+        def _as_float_2d(value, key: str) -> torch.Tensor:
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"Unsupported state type for {key}: {type(value)}")
+            value = value.to(dtype=torch.float32)
+            if value.dim() == 1:
+                value = value[None, :]
+            if value.dim() != 2:
+                raise ValueError(f"Expected state token {key} as [T,D] or [D], got {tuple(value.shape)}")
+            return value[:1]
 
         def _to_padded_1d(x, target_dim, pad_value: float, device):
             t = torch.as_tensor(x, dtype=torch.float32, device=device).flatten()
@@ -316,26 +319,81 @@ class WATransformsLerobot(WATransforms):
                 out[: t.numel()] = t
             return out
 
-        state_mean = _to_padded_1d(stats_dict["norm_stats"]["observation.state"]["mean"], sd, 0.0, state.device)
-        state_std = _to_padded_1d(stats_dict["norm_stats"]["observation.state"]["std"], sd, 1.0, state.device)
-        delta_mean = _to_padded_1d(stats_dict["norm_stats"]["action"]["mean"], ad, 0.0, action.device)
-        delta_std = _to_padded_1d(stats_dict["norm_stats"]["action"]["std"], ad, 1.0, action.device)
+        def _stats_field(norm_key: str):
+            return stats_dict.get("norm_stats", {}).get(norm_key, None)
 
-        eps = 1e-8
-        # Detect zero-std dims: set normalized value to 0 instead of dividing by ~0
-        zero_std_threshold = 1e-4
-        state_zero_mask = state_std < zero_std_threshold
-        action_zero_mask = delta_std < zero_std_threshold
+        def _normalize_state_token(token: torch.Tensor, norm_key: str, token_dim: int) -> torch.Tensor:
+            token = _pad_truncate_last(token, token_dim)
+            field = _stats_field(norm_key)
+            if field is None:
+                mean = torch.zeros(token_dim, dtype=torch.float32, device=token.device)
+                std = torch.ones(token_dim, dtype=torch.float32, device=token.device)
+            else:
+                mean = _to_padded_1d(field.get("mean", []), token_dim, 0.0, token.device)
+                std = _to_padded_1d(field.get("std", []), token_dim, 1.0, token.device)
+            zero_mask = std < 1e-4
+            norm_token = (token - mean) / std.clamp_min(1e-8)
+            norm_token[..., zero_mask] = 0.0
+            return norm_token
 
-        norm_state = (state - state_mean) / state_std.clamp_min(eps)
-        norm_state[..., state_zero_mask] = 0.0  # zero-std dims → 0
+        # Pad / truncate action to model_action_dim.
+        action = _pad_truncate_last(action, ad)
+
+        # Delta mask templates — only used when action_dim == state_dim (dims semantically aligned).
+        delta_mask_templates = {
+            0: np.array([True, True, True, True, True, True, False, True, True, True, True, True, True, False], dtype=bool),
+            1: np.array([True, True, True, True, True, True, True, False, True, True, True, True, True, True, True, False], dtype=bool),
+            2: np.array([False] * 16, dtype=bool),  # robocasa PandaOmron: action is already delta-like
+            3: np.array([False] * 66, dtype=bool),  # g1 sonic latent: 66-d, no delta, all dims supervised
+        }
+        base = delta_mask_templates.get(robotype_embed_id, None)
+        assert base is not None, f"robotype_embed_id {robotype_embed_id} not found in delta_mask_templates"
+
+        state_for_delta = None
+        if self.multi_state_mode:
+            state_tokens = []
+            state_valid = []
+            token_dims = self.state_token_dims or [sd] * len(self.state_keys)
+            for key, norm_key, token_dim in zip(self.state_keys, self.state_norm_keys, token_dims):
+                if key in data_dict:
+                    token = _as_float_2d(data_dict[key], key)
+                    token = _normalize_state_token(token, norm_key, int(token_dim))
+                    token = _pad_truncate_last(token, sd)
+                    state_valid.append(True)
+                else:
+                    token = torch.zeros((1, sd), dtype=torch.float32, device=action.device)
+                    state_valid.append(False)
+                state_tokens.append(token.squeeze(0))
+            norm_state = torch.stack(state_tokens, dim=0)
+            state_mask = torch.as_tensor(state_valid, dtype=torch.bool, device=norm_state.device)
+        else:
+            if self.state_key not in data_dict:
+                raise KeyError(f"Missing state key: {self.state_key}")
+            state = _as_float_2d(data_dict[self.state_key], self.state_key)
+            state_for_delta = _pad_truncate_last(state, sd)
+            norm_state = _normalize_state_token(state_for_delta, self.state_norm_keys[0], sd)
+            state_mask = torch.ones((1,), dtype=torch.bool, device=norm_state.device)
+
+        # Delta: action - state only for the legacy single-token aligned state path.
+        delta = action.clone()
+        if state_for_delta is not None and ad == sd:
+            mask = base[:ad] if len(base) >= ad else np.pad(base, (0, ad - len(base)), constant_values=False)
+            mask_t = torch.as_tensor(mask, dtype=torch.bool, device=action.device)
+            idx = torch.nonzero(mask_t, as_tuple=False).flatten()
+            if idx.numel() > 0:
+                delta[:, idx] = action[:, idx] - state_for_delta[:, idx]
+
+        action_field = _stats_field("action") or {}
+        delta_mean = _to_padded_1d(action_field.get("mean", []), ad, 0.0, action.device)
+        delta_std = _to_padded_1d(action_field.get("std", []), ad, 1.0, action.device)
+        action_zero_mask = delta_std < 1e-4
 
         if self.skip_action_norm:
             norm_delta = delta.clone()
-            norm_delta[..., action_zero_mask] = 0.0  # zero-std dims → 0
+            norm_delta[..., action_zero_mask] = 0.0
         else:
-            norm_delta = (delta - delta_mean) / delta_std.clamp_min(eps)
-            norm_delta[..., action_zero_mask] = 0.0  # zero-std dims → 0
+            norm_delta = (delta - delta_mean) / delta_std.clamp_min(1e-8)
+            norm_delta[..., action_zero_mask] = 0.0
 
         prompt = data_dict.get("t5_embedding", None)
         if prompt is None:
@@ -357,6 +415,7 @@ class WATransformsLerobot(WATransforms):
         out["prompt_embeds"] = prompt_embeds
         out["action"] = norm_delta
         out["state"] = norm_state
+        out["state_mask"] = state_mask
         out["robotype_embed_id"] = torch.tensor(int(robotype_embed_id), dtype=torch.long)
 
         keys = list(out.keys())

@@ -306,6 +306,33 @@ class MoTWorldActionTransformer(nn.Module):
         allowed[:prefix_end, prefix_end:] = False
         return _additive_mask(allowed, dtype=dtype)
 
+    @staticmethod
+    def _mask_missing_state_columns(
+        attention_mask: torch.Tensor,
+        state_mask: Optional[torch.Tensor],
+        num_state_tokens: int,
+    ) -> torch.Tensor:
+        if state_mask is None:
+            return attention_mask
+        if state_mask.ndim == 1:
+            state_mask = state_mask[None, :]
+        if state_mask.shape[1] != num_state_tokens:
+            raise ValueError(
+                f"Expected state_mask second dim {num_state_tokens}, got {tuple(state_mask.shape)}"
+            )
+        missing = ~state_mask.to(device=attention_mask.device, dtype=torch.bool)
+        if not bool(missing.any().item()):
+            return attention_mask
+        if attention_mask.ndim == 2:
+            attention_mask = attention_mask.unsqueeze(0).expand(state_mask.shape[0], -1, -1).clone()
+        else:
+            attention_mask = attention_mask.clone()
+        attention_mask[:, :, :num_state_tokens] = attention_mask[:, :, :num_state_tokens].masked_fill(
+            missing[:, None, :],
+            float("-inf"),
+        )
+        return attention_mask
+
     def _forward_full(
         self,
         noisy_latents: torch.Tensor,
@@ -316,6 +343,7 @@ class MoTWorldActionTransformer(nn.Module):
         return_dict: bool,
         state: torch.Tensor,
         action: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
     ):
         hidden_states = torch.cat([ref_latents, noisy_latents], dim=2)
         batch_size, _, num_frames, height, width = hidden_states.shape
@@ -351,6 +379,7 @@ class MoTWorldActionTransformer(nn.Module):
             state_timestep=state_ts,
             action_timestep=action_ts,
             encoder_hidden_states=encoder_hidden_states,
+            state_mask=state_mask,
         )
 
         layout = [
@@ -367,6 +396,7 @@ class MoTWorldActionTransformer(nn.Module):
             device=video_pre["tokens"].device,
             dtype=video_pre["tokens"].dtype,
         )
+        attention_mask = self._mask_missing_state_columns(attention_mask, state_mask, num_state_tokens)
         tokens_out = self.mot(
             embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
             attention_mask=attention_mask,
@@ -396,6 +426,7 @@ class MoTWorldActionTransformer(nn.Module):
         return_dict: bool,
         state: torch.Tensor,
         action: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
     ):
         batch_size, _, _, height, width = ref_latents.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -423,6 +454,7 @@ class MoTWorldActionTransformer(nn.Module):
             state_timestep=state_ts,
             action_timestep=action_ts,
             encoder_hidden_states=encoder_hidden_states,
+            state_mask=state_mask,
         )
 
         image_key = None
@@ -445,6 +477,7 @@ class MoTWorldActionTransformer(nn.Module):
             image_key,
             num_state_tokens,
             num_ref_tokens,
+            None if state_mask is None else tuple(state_mask.detach().to("cpu").reshape(-1).tolist()),
         )
         cached = getattr(self, "_action_only_prefix_cache", None)
         prefix_cache = None
@@ -466,6 +499,7 @@ class MoTWorldActionTransformer(nn.Module):
                 device=video_pre["tokens"].device,
                 dtype=video_pre["tokens"].dtype,
             )
+            prefix_mask = self._mask_missing_state_columns(prefix_mask, state_mask, num_state_tokens)
             prefix_cache = self.mot.prefill_prefix_cache(
                 embeds_all={
                     "action": action_pre["tokens"][:, :num_state_tokens],
@@ -494,6 +528,11 @@ class MoTWorldActionTransformer(nn.Module):
             device=action_pre["tokens"].device,
             dtype=action_pre["tokens"].dtype,
         )
+        action_attention_mask = self._mask_missing_state_columns(
+            action_attention_mask,
+            state_mask,
+            num_state_tokens,
+        )
         action_tokens = self.mot.forward_action_with_prefix_cache(
             action_tokens=action_pre["tokens"][:, num_state_tokens:],
             action_rotary=_slice_rotary(action_pre["rotary_emb"], num_state_tokens, num_state_tokens + num_action_tokens),
@@ -518,6 +557,7 @@ class MoTWorldActionTransformer(nn.Module):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         state: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
+        state_mask: Optional[torch.Tensor] = None,
         action_only: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         if attention_kwargs is not None and attention_kwargs.get("scale", None) not in (None, 1.0):
@@ -534,6 +574,7 @@ class MoTWorldActionTransformer(nn.Module):
                 return_dict=return_dict,
                 state=state,
                 action=action,
+                state_mask=state_mask,
             )
         return self._forward_full(
             noisy_latents=noisy_latents,
@@ -544,6 +585,7 @@ class MoTWorldActionTransformer(nn.Module):
             return_dict=return_dict,
             state=state,
             action=action,
+            state_mask=state_mask,
         )
 
 

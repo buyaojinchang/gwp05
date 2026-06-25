@@ -1,0 +1,13 @@
+# @package _global_
+#
+# MoT training on the locomanip pick_place (G1 cola task) with 66-d sonic latent
+# actions. Selects the pick_place_g1_sonic data group and the MoT model.
+# All hyperparameters come from train.yaml; override on the CLI as needed, e.g.:
+#   ... task=pick_place_g1_sonic_mot train.max_epochs=1 data.batch_size_per_gpu=2
+
+defaults:
+  - override /data: pick_place_g1_sonic
+  - override /model: mot
+  - _self_
+
+exp_name: pick_place_g1_sonic_mot

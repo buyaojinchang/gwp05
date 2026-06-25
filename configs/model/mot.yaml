@@ -1,0 +1,30 @@
+# MoT world-action model (FastWAM-style mixture-of-transformers).
+# action_dim / state_dim are pulled from the selected data group so they are
+# defined in exactly one place.
+
+pretrained: ${oc.env:WAN22_DIFFUSERS_PATH,/home/s4090/hengtao.li/2_data_ckpt_cache/locomanip/pretrained_ckpt/Wan2.2-TI2V-5B-Diffusers}
+checkpoint: null
+strict: false
+type: mot
+
+action_dim: ${data.action_dim}
+state_dim: ${data.state_dim}
+state_token_dims: ${data.state_token_dims}
+num_state_tokens: ${data.num_state_tokens}
+
+mot_checkpoint_mixed_attn: true
+video_attention_mask_mode: gwp_casual
+
+action_expert:
+  hidden_dim: 1024
+  ffn_dim: 4096
+  state_token_dims: ${data.state_token_dims}
+
+flow_shift: 2.0              # video uses a smaller shift for finer denoising / better gradient signal
+action_flow_shift: 5.0       # action keeps 5.0
+expand_timesteps: true
+action_loss_weight: 1.0
+visual_loss_weight: 1.0
+view_dir: ${project_dir}
+state_repeats: 1
+view_interval: 200

@@ -1,0 +1,28 @@
+# @package _global_
+#
+# Stage 1 — video pretrain.
+# Inherit the pick_place_g1_sonic MoT base task, freeze the action expert and
+# train the video (world-model) branch only for 1 epoch (action_loss_weight=0).
+# Starts from the Wan2.2-TI2V-5B pretrained transformer (model.checkpoint=null).
+#
+# 8-GPU launch: bash train_pick_place_g1_sonic_mot_video_pt_g8.sh
+
+defaults:
+  - pick_place_g1_sonic_mot
+  - _self_
+
+exp_name: pick_place_g1_sonic_mot_video_pt
+
+model:
+  checkpoint: null
+  freeze_action: true
+  use_gt_action_for_video: true
+  action_loss_weight: 0.0
+  visual_loss_weight: 1.0
+
+schedulers:
+  decay_epochs: 1
+
+train:
+  max_epochs: 1
+  checkpoint_epoch_interval: 1

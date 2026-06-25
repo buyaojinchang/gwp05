@@ -1,0 +1,24 @@
+# @package _global_
+#
+# Video-pretrain stage: inherit the gwp_v0 base task, then freeze the action
+# expert and train video only for 1 epoch (action_loss_weight=0).
+
+defaults:
+  - gwp_v0_heat_food_fold_shirt_mot
+  - _self_
+
+exp_name: gwp_v0_heat_food_fold_shirt_mot_video_pt
+
+model:
+  checkpoint: null
+  freeze_action: true
+  use_gt_action_for_video: true
+  action_loss_weight: 0.0
+  visual_loss_weight: 1.0
+
+schedulers:
+  decay_epochs: 1
+
+train:
+  max_epochs: 1
+  checkpoint_epoch_interval: 1
