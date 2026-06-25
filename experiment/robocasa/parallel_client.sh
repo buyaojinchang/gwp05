@@ -4,15 +4,15 @@
 #
 # Server-side action_chunk is chosen in parallel_server_tshape.sh.
 # Client reads FPS & ACTION_CHUNK from $GWP_MOT_OUTPUT_ROOT/robocasa_eval/.server_tshape_info.
-export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 TASK_SET="${1:-atomic_seen}"
-SPLIT="target"
-NUM_TRIALS=50
-REPLAN_STEPS=20
+SPLIT="${SPLIT:-target}"
+NUM_TRIALS="${NUM_TRIALS:-50}"
+REPLAN_STEPS="${REPLAN_STEPS:-20}"
+CLIENT_GPU_OFFSET="${CLIENT_GPU_OFFSET:-4}"
 
 cd "$PROJECT_ROOT"
 
@@ -28,6 +28,8 @@ echo "Using server info: $INFO_FILE"
 source "$INFO_FILE"
 FPS="${FPS:-20}"
 ACTION_CHUNK="${ACTION_CHUNK:-24}"
+NUM_SERVERS="${NUM_SERVERS:-${NUM_WORKERS:-4}}"
+NUM_CLIENTS="${NUM_CLIENTS:-${NUM_WORKERS:-$NUM_SERVERS}}"
 
 # Derive LOG_DIR from checkpoint path
 CKPT_DIR="$(dirname "$CHECKPOINT")"
@@ -41,22 +43,24 @@ CLIENT_LOG_DIR="$RUNTIME_DIR/client/${TIMESTAMP}"
 mkdir -p "$CLIENT_LOG_DIR"
 
 echo "============================================================"
-echo "  Launching $NUM_WORKERS clients"
+echo "  Launching $NUM_CLIENTS clients across $NUM_SERVERS servers"
 echo "  Task set: $TASK_SET"
+echo "  Split: $SPLIT"
 echo "  FPS (eval): $FPS  |  action_chunk: $ACTION_CHUNK (~$(awk "BEGIN{printf \"%.2f\", $ACTION_CHUNK/$FPS}")s per chunk, must match server)"
-echo "  Ports: $BASE_PORT - $((BASE_PORT + NUM_WORKERS - 1))"
+echo "  Ports: $BASE_PORT - $((BASE_PORT + NUM_SERVERS - 1))"
+echo "  Mapping: client worker_id % $NUM_SERVERS -> server port"
 echo "  Log dir: $LOG_DIR"
 echo "  Terminal logs: $CLIENT_LOG_DIR"
 echo "============================================================"
 
 PIDS=()
-for i in $(seq 0 $((NUM_WORKERS - 1))); do
-    PORT=$((BASE_PORT + i))
-    GPU=$((4 + i))
-    # GPU=$i
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
+    SERVER_IDX=$((i % NUM_SERVERS))
+    PORT=$((BASE_PORT + SERVER_IDX))
+    GPU=$((CLIENT_GPU_OFFSET + SERVER_IDX))
     LOG="${CLIENT_LOG_DIR}/client_${i}.log"
 
-    echo "  [Client $i] GPU=$GPU  Port=$PORT  Worker=$i/$NUM_WORKERS  Log=$LOG"
+    echo "  [Client $i] GPU=$GPU  Port=$PORT  Worker=$i/$NUM_CLIENTS  Log=$LOG"
 
     CUDA_VISIBLE_DEVICES=$GPU python -u experiment/robocasa/inference_client.py \
         --port $PORT \
@@ -67,7 +71,7 @@ for i in $(seq 0 $((NUM_WORKERS - 1))); do
         --action_chunk $ACTION_CHUNK \
         --log_dir "$LOG_DIR" \
         --worker_id $i \
-        --num_workers $NUM_WORKERS \
+        --num_workers $NUM_CLIENTS \
         > "$LOG" 2>&1 &
 
     PIDS+=($!)
@@ -78,14 +82,14 @@ PID_FILE="${CLIENT_LOG_DIR}/pids.txt"
 echo "kill ${PIDS[*]}" > "$PID_FILE"
 echo "" >> "$PID_FILE"
 echo "# Client PIDs - $(date)" >> "$PID_FILE"
-for i in $(seq 0 $((NUM_WORKERS - 1))); do
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
     echo "client_${i}: ${PIDS[$i]}" >> "$PID_FILE"
 done
 
 echo ""
 echo "Client PIDs: ${PIDS[*]}"
 echo "PIDs saved to: $PID_FILE"
-echo "Logs: ${CLIENT_LOG_DIR}/client_{0..3}.log"
+echo "Logs: ${CLIENT_LOG_DIR}/client_*.log"
 echo ""
 echo "Monitor progress:"
 echo "  tail -f ${CLIENT_LOG_DIR}/client_0.log"
@@ -98,7 +102,7 @@ wait
 
 echo ""
 echo "============================================================"
-echo "  All $NUM_WORKERS workers finished!"
+echo "  All $NUM_CLIENTS workers finished!"
 echo "  Per-task stats:  $LOG_DIR/<task>/<timestamp>/stats.json"
 echo "============================================================"
 
@@ -183,6 +187,8 @@ out = {
 }
 os.makedirs(os.path.dirname(summary_file), exist_ok=True)
 with open(summary_file, "w") as f:
+    json.dump(out, f, indent=2)
+with open(os.path.join(log_dir, "summary_latest.json"), "w") as f:
     json.dump(out, f, indent=2)
 print(f"  Summary written to: {summary_file}")
 PY

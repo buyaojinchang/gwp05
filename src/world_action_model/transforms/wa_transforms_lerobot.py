@@ -34,6 +34,8 @@ class WATransformsLerobot(WATransforms):
         skip_action_norm=False,
         tshape=False,
         tshape_head_index=0,
+        random_shift_pad=0,
+        resize_mode="crop",
     ):
         if norm_path is None:
             raise ValueError("norm_path is None")
@@ -82,6 +84,10 @@ class WATransformsLerobot(WATransforms):
         self.skip_action_norm = bool(skip_action_norm)
         self.tshape = bool(tshape)
         self.tshape_head_index = int(tshape_head_index)
+        self.random_shift_pad = int(random_shift_pad or 0)
+        self.resize_mode = str(resize_mode)
+        if self.resize_mode not in ("crop", "stretch"):
+            raise ValueError(f"Unsupported resize_mode={self.resize_mode!r}; expected 'crop' or 'stretch'")
         self._warned_unknown_robotype = False
         self._warned_stats_fallback = False
 
@@ -152,18 +158,36 @@ class WATransformsLerobot(WATransforms):
 
     def _process_images(self, input_images: torch.Tensor, dst_width: int, dst_height: int) -> torch.Tensor:
         input_images = input_images.to(dtype=torch.float32) / 255.0
-        height = int(input_images.shape[2])
-        width = int(input_images.shape[3])
-        if float(dst_height) / height < float(dst_width) / width:
-            new_height = int(round(float(dst_width) / width * height))
-            new_width = dst_width
+        if self.resize_mode == "stretch":
+            input_images = F.resize(input_images, (dst_height, dst_width), InterpolationMode.BILINEAR)
         else:
-            new_height = dst_height
-            new_width = int(round(float(dst_height) / height * width))
-        input_images = F.resize(input_images, (new_height, new_width), InterpolationMode.BILINEAR)
-        x1 = random.randint(0, new_width - dst_width)
-        y1 = random.randint(0, new_height - dst_height)
-        input_images = F.crop(input_images, y1, x1, dst_height, dst_width)
+            height = int(input_images.shape[2])
+            width = int(input_images.shape[3])
+            if float(dst_height) / height < float(dst_width) / width:
+                new_height = int(round(float(dst_width) / width * height))
+                new_width = dst_width
+            else:
+                new_height = dst_height
+                new_width = int(round(float(dst_height) / height * width))
+            input_images = F.resize(input_images, (new_height, new_width), InterpolationMode.BILINEAR)
+            x1 = random.randint(0, new_width - dst_width)
+            y1 = random.randint(0, new_height - dst_height)
+            input_images = F.crop(input_images, y1, x1, dst_height, dst_width)
+        if self.is_train and self.random_shift_pad > 0:
+            max_pad = min(self.random_shift_pad, (dst_width - 1) // 4, (dst_height - 1) // 4)
+            if max_pad > 0:
+                inner_width = dst_width - 2 * max_pad
+                inner_height = dst_height - 2 * max_pad
+                input_images = F.resize(input_images, (inner_height, inner_width), InterpolationMode.BILINEAR)
+                pad_left = random.randint(0, 2 * max_pad)
+                pad_top = random.randint(0, 2 * max_pad)
+                pad_right = dst_width - inner_width - pad_left
+                pad_bottom = dst_height - inner_height - pad_top
+                input_images = torch_F.pad(
+                    input_images,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="replicate",
+                )
         input_images = self.normalize(input_images)
         return input_images
 

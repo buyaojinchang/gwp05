@@ -22,11 +22,64 @@ from torchvision.transforms import functional as TF
 
 logger = logging.getLogger(__name__)
 
+RAW_VIEW_KEYS = [
+    "observation.images.robot0_agentview_left",
+    "observation.images.robot0_eye_in_hand",
+    "observation.images.robot0_agentview_right",
+]
+GWP_V0_RAW_VIEW_KEYS = [
+    "observation.images.cam_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+]
+RAW_VIEW_KEY_GROUPS = [RAW_VIEW_KEYS, GWP_V0_RAW_VIEW_KEYS]
+TSHAPE_VIEW_KEY = "observation.images.tshape"
+
+ACTION_DIM_NAMES = [
+    "base_x",
+    "base_y",
+    "base_yaw",
+    "ee_rot_rx_zero_std",
+    "ctrl_mode",
+    "ee_x",
+    "ee_y",
+    "ee_z",
+    "ee_rot_x",
+    "ee_rot_y",
+    "ee_rot_z",
+    "gripper",
+]
+
+try:
+    from configs.robocasa_task_sets import ATOMIC_SEEN_TASKS
+except Exception:
+    ATOMIC_SEEN_TASKS = frozenset({
+        "CloseBlenderLid",
+        "CloseFridge",
+        "CloseToasterOvenDoor",
+        "CoffeeSetupMug",
+        "NavigateKitchen",
+        "OpenCabinet",
+        "OpenDrawer",
+        "OpenStandMixerHead",
+        "PickPlaceCounterToCabinet",
+        "PickPlaceCounterToStove",
+        "PickPlaceDrawerToCounter",
+        "PickPlaceSinkToCounter",
+        "PickPlaceToasterToCounter",
+        "SlideDishwasherRack",
+        "TurnOffStove",
+        "TurnOnElectricKettle",
+        "TurnOnMicrowave",
+        "TurnOnSinkFaucet",
+    })
+
 # -- Model loading ---------------------------------------------------------
 
 def build_model(pretrained_path, checkpoint_path, action_dim=12, state_dim=16,
                 flow_shift=5.0, device="cuda", dtype=torch.bfloat16,
-                action_expert_hidden_dim=1024, action_expert_ffn_dim=4096):
+                action_expert_hidden_dim=1024, action_expert_ffn_dim=4096,
+                mot_checkpoint_mixed_attn=True):
     from diffusers.models import AutoencoderKLWan
     from world_action_model.models.transformer_wa_mot import MoTWorldActionTransformer
     from world_action_model.trainers.wa_trainer import get_model_path, process_transformer
@@ -48,7 +101,7 @@ def build_model(pretrained_path, checkpoint_path, action_dim=12, state_dim=16,
             "hidden_dim": int(action_expert_hidden_dim),
             "ffn_dim": int(action_expert_ffn_dim),
         },
-        mot_checkpoint_mixed_attn=False,
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_attention_mask_mode="gwp_casual",
     )
     process_transformer(transformer.video_expert, {})
@@ -103,6 +156,190 @@ def denormalize_action(action, norm):
     return action * norm["action_std"].clamp_min(1e-8) + norm["action_mean"]
 
 
+def active_action_dims(norm, actual_dim, include_zero_std_dims=False, threshold=1e-4):
+    """Return action dims used for metrics/primary plots, matching training mask."""
+    if include_zero_std_dims:
+        return list(range(actual_dim)), []
+    action_std = norm["action_std"][:actual_dim].detach().float().cpu().numpy()
+    active = [int(i) for i, std in enumerate(action_std) if float(std) >= threshold]
+    ignored = [int(i) for i, std in enumerate(action_std) if float(std) < threshold]
+    if len(active) == 0:
+        active = list(range(actual_dim))
+        ignored = []
+    return active, ignored
+
+
+def action_stats(arr):
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        return {"abs_sum": 0.0, "max_abs": 0.0, "mean_abs_dim": [], "std_dim": []}
+    return {
+        "abs_sum": float(np.abs(arr).sum()),
+        "max_abs": float(np.abs(arr).max()),
+        "mean_abs_dim": np.abs(arr).mean(axis=0).astype(float).tolist(),
+        "std_dim": arr.std(axis=0).astype(float).tolist(),
+    }
+
+
+def action_delta_mask(mode, action_dim):
+    """Return dims that are represented as action-state deltas in training."""
+    if mode == "raw":
+        return None
+    if mode != "agilex_cobot_magic":
+        raise ValueError(f"Unsupported gt_delta_mode: {mode}")
+    base = np.asarray(
+        [True, True, True, True, True, True, False,
+         True, True, True, True, True, True, False],
+        dtype=bool,
+    )
+    if action_dim <= base.shape[0]:
+        return base[:action_dim]
+    return np.pad(base, (0, action_dim - base.shape[0]), constant_values=False)
+
+
+def state_base_for_action(states, start, action_dim):
+    base = np.zeros((action_dim,), dtype=states.dtype)
+    if states.shape[0] > start:
+        n = min(action_dim, states.shape[-1])
+        base[:n] = states[start, :n]
+    return base
+
+
+def raw_to_delta_action_chunk(raw_actions, states, start, end, mode):
+    chunk = raw_actions[start:end].copy()
+    mask = action_delta_mask(mode, chunk.shape[-1])
+    if mask is None:
+        return chunk
+    base = state_base_for_action(states, start, chunk.shape[-1])
+    chunk[:, mask] = chunk[:, mask] - base[mask]
+    return chunk
+
+
+def delta_to_raw_action_chunk(delta_actions, states, start, mode):
+    chunk = delta_actions.copy()
+    mask = action_delta_mask(mode, chunk.shape[-1])
+    if mask is None:
+        return chunk
+    base = state_base_for_action(states, start, chunk.shape[-1])
+    chunk[:, mask] = chunk[:, mask] + base[mask]
+    return chunk
+
+
+def offset_mae_stats(gt, pr, frame_mask, step_interval, active_dims):
+    if step_interval <= 0:
+        return []
+    err = np.abs(gt[:, active_dims] - pr[:, active_dims]).mean(axis=1)
+    frame_idx = np.arange(gt.shape[0])
+    rows = []
+    for offset in range(step_interval):
+        m = (frame_idx % step_interval == offset) & frame_mask
+        rows.append({
+            "offset": int(offset),
+            "num_frames": int(m.sum()),
+            "mae": float(err[m].mean()) if m.any() else None,
+        })
+    return rows
+
+
+def block_mae_stats(gt, pr, frame_mask, step_interval, active_dims, max_blocks=20):
+    if step_interval <= 0:
+        return []
+    err = np.abs(gt[:, active_dims] - pr[:, active_dims]).mean(axis=1)
+    rows = []
+    for block_idx, start in enumerate(range(0, gt.shape[0], step_interval)):
+        if block_idx >= max_blocks:
+            break
+        end = min(start + step_interval, gt.shape[0])
+        m = frame_mask[start:end]
+        rows.append({
+            "block": int(block_idx),
+            "start": int(start),
+            "end": int(end),
+            "num_frames": int(m.sum()),
+            "mae": float(err[start:end][m].mean()) if m.any() else None,
+        })
+    return rows
+
+
+def hold_state_baseline(states, action_dim, step_interval):
+    """Raw-action baseline that keeps the state at each replan boundary."""
+    baseline = np.zeros((states.shape[0], action_dim), dtype=np.float32)
+    state_dim = min(action_dim, states.shape[-1])
+    for start in range(0, states.shape[0], step_interval):
+        end = min(start + step_interval, states.shape[0])
+        baseline[start:end, :state_dim] = states[start, :state_dim]
+    return baseline
+
+
+def per_dim_diagnostics(gt, pr, states, frame_mask, step_interval, action_dim_names):
+    action_dim = gt.shape[-1]
+    baseline = hold_state_baseline(states, action_dim, step_interval)
+    rows = []
+    frame_idx = np.arange(gt.shape[0])
+    for dim in range(action_dim):
+        valid = frame_mask
+        gt_d = gt[valid, dim]
+        pr_d = pr[valid, dim]
+        base_d = baseline[valid, dim]
+        mae = float(np.mean(np.abs(pr_d - gt_d)))
+        mse = float(np.mean((pr_d - gt_d) ** 2))
+        hold_mae = float(np.mean(np.abs(base_d - gt_d)))
+        offset0_mask = valid & ((frame_idx % step_interval) == 0)
+        offset_last_mask = valid & ((frame_idx % step_interval) == (step_interval - 1))
+        rows.append({
+            "dim": int(dim),
+            "name": action_dim_name(action_dim_names, dim),
+            "mae": mae,
+            "mse": mse,
+            "hold_state_mae": hold_mae,
+            "model_over_hold": float(mae / max(hold_mae, 1e-12)),
+            "bias": float(np.mean(pr_d - gt_d)),
+            "gt_std": float(np.std(gt_d)),
+            "pred_std": float(np.std(pr_d)),
+            "offset0_mae": float(np.mean(np.abs(pr[offset0_mask, dim] - gt[offset0_mask, dim]))) if offset0_mask.any() else None,
+            "offset_last_mae": float(np.mean(np.abs(pr[offset_last_mask, dim] - gt[offset_last_mask, dim]))) if offset_last_mask.any() else None,
+        })
+    return rows
+
+
+def action_dim_name(action_dim_names, dim):
+    if action_dim_names is not None and dim < len(action_dim_names):
+        return action_dim_names[dim]
+    if dim < len(ACTION_DIM_NAMES):
+        return ACTION_DIM_NAMES[dim]
+    return f"dim_{dim}"
+
+
+def plot_action_comparison(save_path, task_name, gt, pr, dims, mse, mae,
+                           title_suffix="", action_dim_names=None):
+    if len(dims) == 0:
+        return
+    T = gt.shape[0]
+    cols = 4
+    rows = (len(dims) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
+    axes = np.array(axes).flatten()
+
+    for ax_idx, d in enumerate(dims):
+        ax = axes[ax_idx]
+        label = action_dim_name(action_dim_names, d)
+        ax.plot(range(T), gt[:, d], label="gt", color="tab:blue", linewidth=1.2)
+        ax.plot(range(T), pr[:, d], label="pred", color="tab:orange", linewidth=1.2, alpha=0.8)
+        ax.set_title(f"{d}: {label}", fontsize=10)
+        ax.set_xlabel("Frame", fontsize=8)
+        ax.set_ylabel("Value", fontsize=8)
+        ax.legend(fontsize=7)
+        ax.tick_params(labelsize=7)
+
+    for ax_idx in range(len(dims), len(axes)):
+        axes[ax_idx].set_visible(False)
+
+    fig.suptitle(f"{task_name}{title_suffix}  (MSE={mse:.4f}, MAE={mae:.4f})", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
 # ── Image preprocessing ─────────────────────────────────────────────────
 
 def preprocess_image(img_uint8, dst_size=(320, 256)):
@@ -129,6 +366,8 @@ def sample_action(md, ref_latents, prompt_embeds, state, num_steps=10, num_frame
     """Sample actions from a MoT checkpoint using the action-only path."""
     device, dtype = md["device"], md["dtype"]
     transformer = md["transformer"]
+    if hasattr(transformer, "clear_action_only_cache"):
+        transformer.clear_action_only_cache()
     flow_shift = md.get("action_flow_shift", md["flow_shift"])
     ad = md["action_dim"]
     bs = ref_latents.shape[0]
@@ -194,6 +433,23 @@ def load_episode_data(lerobot_dir, episode_idx, view_keys):
                 num_frames=len(df), task_index=task_index)
 
 
+def load_action_dim_names(lerobot_dir, actual_dim):
+    """Prefer dataset metadata names over the RoboCasa fallback labels."""
+    info_path = os.path.join(lerobot_dir, "meta", "info.json")
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, "r") as f:
+                info = json.load(f)
+            names = info.get("features", {}).get("action", {}).get("names")
+            if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+                names = names[0]
+            if isinstance(names, list) and len(names) >= actual_dim:
+                return [str(n) for n in names[:actual_dim]]
+        except Exception as exc:
+            logger.warning("Failed to read action names from %s: %s", info_path, exc)
+    return [action_dim_name(None, i) for i in range(actual_dim)]
+
+
 # ── T5 embedding loader ─────────────────────────────────────────────
 
 T5_MAX_LEN = 64
@@ -236,28 +492,12 @@ def load_t5_embedding(lerobot_dir, episode_idx, device, dtype, task_index=0):
 
 # ── Open-loop evaluation ────────────────────────────────────────────────
 
-@torch.no_grad()
-def run_openloop(args, md, norm, t5_emb):
-    device, dtype = md["device"], md["dtype"]
-    vae = md["vae"]
-    latents_mean, latents_std = md["latents_mean"], md["latents_std"]
-    action_chunk = args.action_chunk
-    num_frames = args.num_frames
-    action_dim = args.action_dim
-
-    view_keys = [
-        "observation.images.robot0_agentview_left",
-        "observation.images.robot0_eye_in_hand",
-        "observation.images.robot0_agentview_right",
-    ]
-
-    # Find lerobot dirs. Supports two layouts:
-    #   1) pretrain_gwp: <data_root>/{atomic,composite}/<task>/<date_dir>/lerobot
-    #   2) collected:    <data_root>/<task>/lerobot                (flat)
+def discover_lerobot_dirs(data_root):
+    """Find LeRobot dataset dirs under pretrain_gwp or flat collected layouts."""
     lerobot_dirs = []
     nested_found = False
     for cat in ("atomic", "composite"):
-        cat_dir = os.path.join(args.data_root, cat)
+        cat_dir = os.path.join(data_root, cat)
         if not os.path.isdir(cat_dir):
             continue
         nested_found = True
@@ -270,18 +510,63 @@ def run_openloop(args, md, norm, t5_emb):
                 if os.path.isdir(ld):
                     lerobot_dirs.append((task, ld))
     if not nested_found:
-        for task in sorted(os.listdir(args.data_root)):
-            task_dir = os.path.join(args.data_root, task)
+        for task in sorted(os.listdir(data_root)):
+            task_dir = os.path.join(data_root, task)
             if not os.path.isdir(task_dir):
                 continue
             ld = os.path.join(task_dir, "lerobot")
             if os.path.isdir(ld):
                 lerobot_dirs.append((task, ld))
+    return lerobot_dirs
+
+
+def select_lerobot_dirs(lerobot_dirs, args):
+    task_filter = None
+    if args.task_set == "atomic_seen":
+        task_filter = set(ATOMIC_SEEN_TASKS)
+    if args.task_names:
+        explicit = set(args.task_names)
+        task_filter = explicit if task_filter is None else task_filter & explicit
+
+    if task_filter is not None:
+        available_before_filter = {task for task, _ in lerobot_dirs}
+        missing_before_filter = sorted(task_filter - available_before_filter)
+        if missing_before_filter and args.task_set == "atomic_seen" and not args.task_names:
+            raise RuntimeError(f"Missing atomic_seen tasks under data_root: {missing_before_filter}")
+        lerobot_dirs = [(task, ld) for task, ld in lerobot_dirs if task in task_filter]
+
+    if args.one_per_task:
+        selected = []
+        seen = set()
+        for task, ld in lerobot_dirs:
+            if task in seen:
+                continue
+            selected.append((task, ld))
+            seen.add(task)
+        lerobot_dirs = selected
 
     if args.max_datasets > 0:
         lerobot_dirs = lerobot_dirs[:args.max_datasets]
 
+    return lerobot_dirs
+
+
+@torch.no_grad()
+def run_openloop(args, md, norm, t5_emb):
+    device, dtype = md["device"], md["dtype"]
+    vae = md["vae"]
+    latents_mean, latents_std = md["latents_mean"], md["latents_std"]
+    action_chunk = args.action_chunk
+    num_frames = args.num_frames
+    action_dim = args.action_dim
+
+    view_keys = [TSHAPE_VIEW_KEY] + [vk for group in RAW_VIEW_KEY_GROUPS for vk in group]
+    lerobot_dirs = select_lerobot_dirs(discover_lerobot_dirs(args.data_root), args)
+    selected_tasks = [task for task, _ in lerobot_dirs]
+
     print(f"Found {len(lerobot_dirs)} datasets, evaluating episode {args.episode_idx} from each")
+    print(f"Task set: {args.task_set}; one_per_task={args.one_per_task}")
+    print(f"Selected tasks: {selected_tasks}")
 
     # fallback t5 embedding (zeros)
     fallback_t5 = t5_emb.unsqueeze(0).to(device, dtype=dtype)
@@ -306,42 +591,64 @@ def run_openloop(args, md, norm, t5_emb):
             print(f"  Loaded t5 embedding: {prompt_embeds.shape}")
 
         T = ep["num_frames"]
-        gt_actions = ep["actions"]  # T, action_dim
-        print(f"  Episode length: {T} frames, action_dim: {gt_actions.shape[-1]}")
+        raw_gt_actions = ep["actions"]  # T, action_dim
+        states_np = ep["states"]
+        print(f"  Episode length: {T} frames, action_dim: {raw_gt_actions.shape[-1]}")
 
         # Sliding window: step through episode, generate num_frames actions,
         # then accumulate the first action_chunk predictions.
-        all_pred = np.zeros_like(gt_actions)  # T, action_dim
+        all_pred = np.zeros_like(raw_gt_actions)  # T, action_dim
+        all_gt = np.zeros_like(raw_gt_actions)  # T, action_dim in the requested comparison space
         pred_counts = np.zeros(T)
+        gt_counts = np.zeros(T)
+
+        available_views = sorted(ep["frames"].keys())
+        view_mode = args.input_view_mode
+        if view_mode == "auto":
+            view_mode = "tshape" if TSHAPE_VIEW_KEY in ep["frames"] else "raw"
+        print(f"  Loaded video views: {available_views if available_views else 'none'}")
+        print(f"  Input view mode: {view_mode}")
 
         step_interval = args.replan_steps
         for start in range(0, T, step_interval):
-            # Build the MoT T-shape observation: head view at full size, wrist
-            # views half-sized and concatenated below it.
             dst_w, dst_h = tuple(args.dst_size)
-            half_w, half_h = dst_w // 2, dst_h // 2
-            head_idx = args.tshape_head_index
-            ts_images = []
-            for vi, vk in enumerate(view_keys):
-                if vk not in ep["frames"] or start >= len(ep["frames"][vk]):
+            if view_mode == "tshape":
+                frames = ep["frames"].get(TSHAPE_VIEW_KEY)
+                if frames is None or start >= len(frames):
+                    print(f"  Skipping frame {start}: missing {TSHAPE_VIEW_KEY}")
                     continue
-                raw = ep["frames"][vk][start]
-                size = (dst_w, dst_h) if vi == head_idx else (half_w, half_h)
-                ts_images.append((vi, preprocess_image(raw, size)))
+                ref_image = preprocess_image(frames[start], (dst_w, dst_h)).to(device, dtype=dtype)
+            elif view_mode == "raw":
+                half_w, half_h = dst_w // 2, dst_h // 2
+                head_idx = args.tshape_head_index
+                head = None
+                others = []
+                for raw_view_keys in RAW_VIEW_KEY_GROUPS:
+                    ts_images = []
+                    for vi, vk in enumerate(raw_view_keys):
+                        if vk not in ep["frames"] or start >= len(ep["frames"][vk]):
+                            continue
+                        raw = ep["frames"][vk][start]
+                        size = (dst_w, dst_h) if vi == head_idx else (half_w, half_h)
+                        ts_images.append((vi, preprocess_image(raw, size)))
 
-            head = next((img for i, img in ts_images if i == head_idx), None)
-            others = [img for i, img in ts_images if i != head_idx]
-            if head is None or not others:
-                print("  Skipping frame: missing T-shape views")
-                continue
+                    head = next((img for i, img in ts_images if i == head_idx), None)
+                    others = [img for i, img in ts_images if i != head_idx]
+                    if head is not None and others:
+                        break
+                if head is None or not others:
+                    print(f"  Skipping frame {start}: missing raw T-shape views")
+                    continue
 
-            wrist_row = torch.cat(others, dim=-1)
-            if wrist_row.shape[-1] < head.shape[-1]:
-                wrist_row = torch.nn.functional.pad(
-                    wrist_row, (0, head.shape[-1] - wrist_row.shape[-1]))
-            elif wrist_row.shape[-1] > head.shape[-1]:
-                wrist_row = wrist_row[..., :head.shape[-1]]
-            ref_image = torch.cat([head, wrist_row], dim=-2).to(device, dtype=dtype)
+                wrist_row = torch.cat(others, dim=-1)
+                if wrist_row.shape[-1] < head.shape[-1]:
+                    wrist_row = torch.nn.functional.pad(
+                        wrist_row, (0, head.shape[-1] - wrist_row.shape[-1]))
+                elif wrist_row.shape[-1] > head.shape[-1]:
+                    wrist_row = wrist_row[..., :head.shape[-1]]
+                ref_image = torch.cat([head, wrist_row], dim=-2).to(device, dtype=dtype)
+            else:
+                raise ValueError(f"Unsupported input_view_mode: {view_mode}")
             ref_image_5d = ref_image.unsqueeze(2)
             ref_latents = vae.encode(ref_image_5d).latent_dist.mode()
             ref_latents = (ref_latents - latents_mean) * latents_std
@@ -368,59 +675,178 @@ def run_openloop(args, md, norm, t5_emb):
             else:
                 pred = denormalize_action(pred.float().squeeze(0), norm).cpu().numpy()
 
-            # Accumulate predictions (average overlapping chunks)
-            end = min(start + action_chunk, T)
+            # Accumulate predictions. Closed-loop deployment keeps only the
+            # replan prefix from each chunk; evaluating the discarded suffix can
+            # make long-horizon actions dominate open-loop diagnostics.
+            eval_chunk = min(action_chunk, args.replan_steps) if args.eval_replan_prefix_only else action_chunk
+            end = min(start + eval_chunk, T)
             chunk_len = end - start
-            all_pred[start:end] += pred[:chunk_len]
+            pred_chunk = pred[:chunk_len]
+            if args.comparison_space == "raw_from_delta":
+                pred_chunk = delta_to_raw_action_chunk(
+                    pred_chunk,
+                    states_np,
+                    start,
+                    args.gt_delta_mode,
+                )
+                gt_chunk = raw_gt_actions[start:end]
+            elif args.comparison_space == "window_delta":
+                gt_chunk = raw_to_delta_action_chunk(
+                    raw_gt_actions,
+                    states_np,
+                    start,
+                    end,
+                    args.gt_delta_mode,
+                )[:chunk_len]
+            elif args.comparison_space == "raw":
+                gt_chunk = raw_gt_actions[start:end]
+            else:
+                raise ValueError(f"Unsupported comparison_space: {args.comparison_space}")
+
+            all_pred[start:end] += pred_chunk
+            all_gt[start:end] += gt_chunk
             pred_counts[start:end] += 1
+            gt_counts[start:end] += 1
 
         # Average overlapping predictions
         mask = pred_counts > 0
+        covered_frames = int(mask.sum())
+        if covered_frames == 0:
+            raise RuntimeError(
+                f"No predictions were generated for {task_name}. "
+                f"Available video views: {sorted(ep['frames'].keys())}. "
+                "Check --input_view_mode and dataset video keys."
+            )
+        if covered_frames < T:
+            print(f"  Warning: predictions cover {covered_frames}/{T} frames; metrics use covered frames only")
         all_pred[mask] /= pred_counts[mask, None]
+        all_gt[mask] /= gt_counts[mask, None]
 
         # Truncate to actual action dim
-        actual_dim = min(action_dim, gt_actions.shape[-1])
-        gt = gt_actions[:, :actual_dim]
+        actual_dim = min(action_dim, raw_gt_actions.shape[-1])
+        action_dim_names = load_action_dim_names(ld, actual_dim)
+        gt = all_gt[:, :actual_dim]
         pr = all_pred[:, :actual_dim]
+        active_dims, ignored_dims = active_action_dims(
+            norm,
+            actual_dim,
+            include_zero_std_dims=args.include_zero_std_dims,
+            threshold=args.zero_std_threshold,
+        )
 
-        # Compute metrics
-        mse = float(np.mean((gt - pr) ** 2))
-        mae = float(np.mean(np.abs(gt - pr)))
-        print(f"  MSE: {mse:.6f}, MAE: {mae:.6f}")
-        results.append(dict(task=task_name, num_frames=int(T), mse=mse, mae=mae))
+        gt_metric = gt[mask][:, active_dims]
+        pr_metric = pr[mask][:, active_dims]
+        mse = float(np.mean((gt_metric - pr_metric) ** 2))
+        mae = float(np.mean(np.abs(gt_metric - pr_metric)))
+        mse_all = float(np.mean((gt[mask] - pr[mask]) ** 2))
+        mae_all = float(np.mean(np.abs(gt[mask] - pr[mask])))
+        gt_stats = action_stats(gt[mask])
+        pred_stats = action_stats(pr[mask])
+        offset_mae = offset_mae_stats(gt, pr, mask, step_interval, active_dims)
+        block_mae = block_mae_stats(gt, pr, mask, step_interval, active_dims)
+        per_dim = per_dim_diagnostics(gt, pr, states_np, mask, step_interval, action_dim_names)
 
-        # Plot
+        print(f"  Active dims: {active_dims}; ignored zero-std dims: {ignored_dims}")
+        print(f"  GT abs_sum: {gt_stats['abs_sum']:.6f}, Pred abs_sum: {pred_stats['abs_sum']:.6f}")
+        print(f"  MSE(active): {mse:.6f}, MAE(active): {mae:.6f}; MSE(all): {mse_all:.6f}, MAE(all): {mae_all:.6f}")
+        if offset_mae:
+            preview = ", ".join(
+                f"{row['offset']}:{row['mae']:.4f}" for row in offset_mae[:min(10, len(offset_mae))]
+                if row["mae"] is not None
+            )
+            print(f"  Offset MAE preview: {preview}")
+        top_dims = sorted(per_dim, key=lambda row: row["mae"], reverse=True)[:5]
+        print("  Top dim MAE: " + ", ".join(
+            f"{row['dim']}:{row['name']}={row['mae']:.4f}(hold={row['hold_state_mae']:.4f})"
+            for row in top_dims
+        ))
+        results.append(dict(
+            task=task_name,
+            data_path=ld,
+            num_frames=int(T),
+            pred_covered_frames=covered_frames,
+            view_mode=view_mode,
+            comparison_space=args.comparison_space,
+            gt_delta_mode=args.gt_delta_mode,
+            eval_replan_prefix_only=args.eval_replan_prefix_only,
+            eval_chunk=int(eval_chunk),
+            active_dims=active_dims,
+            ignored_dims=ignored_dims,
+            action_dim_names=action_dim_names,
+            mse=mse,
+            mae=mae,
+            mse_all_dims=mse_all,
+            mae_all_dims=mae_all,
+            gt_abs_sum=gt_stats["abs_sum"],
+            pred_abs_sum=pred_stats["abs_sum"],
+            offset_mae=offset_mae,
+            block_mae_first20=block_mae,
+            per_dim_diagnostics=per_dim,
+        ))
+
+        # Plot and diagnostics
         save_dir = os.path.join(args.output_dir, task_name)
         os.makedirs(save_dir, exist_ok=True)
+        plot_action_comparison(
+            os.path.join(save_dir, f"ep{args.episode_idx:03d}_actions.png"),
+            task_name,
+            gt,
+            pr,
+            active_dims,
+            mse,
+            mae,
+            title_suffix=" active dims",
+            action_dim_names=action_dim_names,
+        )
+        if not args.skip_all_dims_plot:
+            plot_action_comparison(
+                os.path.join(save_dir, f"ep{args.episode_idx:03d}_actions_all_dims.png"),
+                task_name,
+                gt,
+                pr,
+                list(range(actual_dim)),
+                mse_all,
+                mae_all,
+                title_suffix=" all dims",
+                action_dim_names=action_dim_names,
+            )
 
-        cols = 4
-        rows = (actual_dim + cols - 1) // cols
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
-        axes = np.array(axes).flatten()
+        np.savez_compressed(
+            os.path.join(save_dir, f"ep{args.episode_idx:03d}_arrays.npz"),
+            gt=gt,
+            pred=pr,
+            pred_counts=pred_counts,
+            gt_counts=gt_counts,
+            active_dims=np.asarray(active_dims, dtype=np.int64),
+            ignored_dims=np.asarray(ignored_dims, dtype=np.int64),
+            action_dim_names=np.asarray(action_dim_names, dtype="U64"),
+        )
 
-        for d in range(actual_dim):
-            ax = axes[d]
-            ax.plot(range(T), gt[:, d], label="gt", color="tab:blue", linewidth=1.2)
-            ax.plot(range(T), pr[:, d], label="pred", color="tab:orange", linewidth=1.2, alpha=0.8)
-            ax.set_title(f"Action Dimension {d}", fontsize=10)
-            ax.set_xlabel("Frame", fontsize=8)
-            ax.set_ylabel("Value", fontsize=8)
-            ax.legend(fontsize=7)
-            ax.tick_params(labelsize=7)
-
-        # Hide unused subplots
-        for d in range(actual_dim, len(axes)):
-            axes[d].set_visible(False)
-
-        fig.suptitle(f"{task_name}  (MSE={mse:.4f}, MAE={mae:.4f})", fontsize=12)
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"ep{args.episode_idx:03d}_actions.png"), dpi=150)
-        plt.close(fig)
-
-        # Save metrics
+        metrics = {
+            "task": task_name,
+            "episode": args.episode_idx,
+            "num_frames": int(T),
+            "pred_covered_frames": covered_frames,
+            "view_mode": view_mode,
+            "comparison_space": args.comparison_space,
+            "gt_delta_mode": args.gt_delta_mode,
+            "eval_replan_prefix_only": args.eval_replan_prefix_only,
+            "eval_chunk": int(eval_chunk),
+            "active_dims": active_dims,
+            "ignored_dims": ignored_dims,
+            "action_dim_names": action_dim_names,
+            "mse": float(mse),
+            "mae": float(mae),
+            "mse_all_dims": float(mse_all),
+            "mae_all_dims": float(mae_all),
+            "gt_stats": gt_stats,
+            "pred_stats": pred_stats,
+            "offset_mae": offset_mae,
+            "block_mae_first20": block_mae,
+            "per_dim_diagnostics": per_dim,
+        }
         with open(os.path.join(save_dir, f"ep{args.episode_idx:03d}_metrics.json"), "w") as f:
-            json.dump({"task": task_name, "episode": args.episode_idx,
-                       "num_frames": T, "mse": float(mse), "mae": float(mae)}, f, indent=2)
+            json.dump(metrics, f, indent=2)
 
         print(f"  Saved to {save_dir}")
 
@@ -464,6 +890,17 @@ def run_openloop(args, md, norm, t5_emb):
         "checkpoint": args.checkpoint_path,
         "data_root": args.data_root,
         "episode": args.episode_idx,
+        "task_set": args.task_set,
+        "task_names": args.task_names,
+        "one_per_task": args.one_per_task,
+        "comparison_space": args.comparison_space,
+        "gt_delta_mode": args.gt_delta_mode,
+        "eval_replan_prefix_only": args.eval_replan_prefix_only,
+        "eval_chunk": int(min(args.action_chunk, args.replan_steps) if args.eval_replan_prefix_only else args.action_chunk),
+        "mot_checkpoint_mixed_attn": args.mot_checkpoint_mixed_attn,
+        "seed": args.seed,
+        "selected_datasets": [{"task": task, "data_path": ld} for task, ld in lerobot_dirs],
+        "action_dim_names": results[0].get("action_dim_names") if results else None,
         "num_tasks": len(results),
         "total_frames": total_frames,
         "mean_mse": mean_mse,
@@ -498,6 +935,8 @@ def parse_args():
                    help="Number of action tokens generated by the MoT model")
     p.add_argument("--action_chunk", type=int, default=24)
     p.add_argument("--num_steps", type=int, default=10)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for action sampling noise")
     p.add_argument("--action_flow_shift", type=float, default=5.0,
                    help="Flow shift for action sampling (default 5.0, matching training)")
     p.add_argument("--replan_steps", type=int, default=24, help="Steps between re-predictions")
@@ -505,14 +944,36 @@ def parse_args():
     p.add_argument("--episode_idx", type=int, default=0, help="Which episode to evaluate")
     p.add_argument("--max_datasets", type=int, default=5,
                    help="Max number of datasets to evaluate (0=all)")
+    p.add_argument("--task_set", choices=["all", "atomic_seen"], default="all",
+                   help="Dataset task subset. atomic_seen matches the training configs.")
+    p.add_argument("--task_names", nargs="*", default=None,
+                   help="Optional explicit task names to evaluate after task_set filtering.")
+    p.add_argument("--one_per_task", action="store_true", default=False,
+                   help="Keep only the first sorted LeRobot dataset/date for each task.")
+    p.add_argument("--comparison_space", choices=["raw", "raw_from_delta", "window_delta"], default="raw",
+                   help="Metric space: legacy raw, denormalized delta + state vs raw GT, or training window-delta.")
+    p.add_argument("--gt_delta_mode", choices=["raw", "agilex_cobot_magic"], default="raw",
+                   help="Delta mask used by raw_from_delta/window_delta comparisons.")
+    p.add_argument("--eval_replan_prefix_only", action="store_true", default=False,
+                   help="Evaluate only the prefix kept by deployment: min(action_chunk, replan_steps).")
     p.add_argument("--skip_action_denorm", action="store_true", default=False,
                    help="Skip action denormalization (use when trained with skip_action_norm=True)")
+    p.add_argument("--input_view_mode", choices=["auto", "tshape", "raw"], default="auto",
+                   help="Video input mode: auto uses observation.images.tshape when present, otherwise raw camera views")
+    p.add_argument("--include_zero_std_dims", action="store_true", default=False,
+                   help="Include zero-std action dims in primary metrics/plot instead of matching the training mask")
+    p.add_argument("--zero_std_threshold", type=float, default=1e-4,
+                   help="Action std threshold used to ignore zero-std dims in primary metrics/plot")
+    p.add_argument("--skip_all_dims_plot", action="store_true", default=False,
+                   help="Skip the diagnostic all-dim plot")
     p.add_argument("--tshape", action="store_true", default=True,
                    help="Compatibility flag; MoT open-loop always uses T-shape layout")
     p.add_argument("--tshape_head_index", type=int, default=2,
                    help="Which view (index into view_keys) is the head (full size). Default 2 = agentview_right")
     p.add_argument("--action_expert_hidden_dim", type=int, default=1024)
     p.add_argument("--action_expert_ffn_dim", type=int, default=4096)
+    p.add_argument("--mot_checkpoint_mixed_attn", action=argparse.BooleanOptionalAction, default=True,
+                   help="Build the MoT wrapper with the same mixed-attn mode as training/deployment configs.")
     return p.parse_args()
 
 
@@ -544,9 +1005,22 @@ def main():
     print(f"  Num frames:   {args.num_frames}")
     print(f"  Action chunk: {args.action_chunk}")
     print(f"  Replan steps: {args.replan_steps}")
+    print(f"  Eval prefix:  {args.eval_replan_prefix_only}")
+    print(f"  Seed:         {args.seed}")
     print(f"  Max datasets: {args.max_datasets}")
+    print(f"  Task set:     {args.task_set}")
+    print(f"  One per task: {args.one_per_task}")
+    print(f"  Compare:      {args.comparison_space}")
+    print(f"  GT mode:      {args.gt_delta_mode}")
+    print(f"  View mode:    {args.input_view_mode}")
     print(f"  Layout:       T-shape (head_index={args.tshape_head_index})")
+    print(f"  MoT mixed:    {args.mot_checkpoint_mixed_attn}")
     print("=" * 60)
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     md = build_model(
         args.model_id,
@@ -557,9 +1031,17 @@ def main():
         dtype=torch.bfloat16,
         action_expert_hidden_dim=args.action_expert_hidden_dim,
         action_expert_ffn_dim=args.action_expert_ffn_dim,
+        mot_checkpoint_mixed_attn=args.mot_checkpoint_mixed_attn,
     )
     md["action_flow_shift"] = args.action_flow_shift
     norm = load_norm_stats(args.stats_path, args.state_dim, args.action_dim, "cuda")
+    active_dims_preview, ignored_dims_preview = active_action_dims(
+        norm,
+        args.action_dim,
+        include_zero_std_dims=args.include_zero_std_dims,
+        threshold=args.zero_std_threshold,
+    )
+    print(f"  Metric dims:  {active_dims_preview} (ignored zero-std: {ignored_dims_preview})")
 
     if args.t5_embedding_path and os.path.exists(args.t5_embedding_path):
         t5 = torch.load(args.t5_embedding_path, map_location="cpu")

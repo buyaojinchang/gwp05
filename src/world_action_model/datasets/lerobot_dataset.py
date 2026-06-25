@@ -31,6 +31,8 @@ import glob
 import json
 import os
 import random
+import signal
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -49,6 +51,8 @@ class LeRobotDataset(Dataset):
         t5_embed_path=None,
         robotype="aloha",
         data_size=None,
+        sample_timeout_sec=None,
+        max_sample_retries=None,
     ):
         if isinstance(data_path, (list, tuple)):
             data_path = data_path[0]
@@ -58,6 +62,13 @@ class LeRobotDataset(Dataset):
         self.video_backend = video_backend
         self.transform = transform
         self.robotype = robotype
+        if sample_timeout_sec is None:
+            sample_timeout_sec = os.environ.get("LEROBOT_SAMPLE_TIMEOUT_SEC", "0")
+        if max_sample_retries is None:
+            max_sample_retries = os.environ.get("LEROBOT_MAX_SAMPLE_RETRIES", "10")
+        self.sample_timeout_sec = float(sample_timeout_sec or 0)
+        self.max_sample_retries = max(1, int(max_sample_retries or 1))
+        self._sample_error_logs = 0
 
         self.episodes: list[dict] = []
         self._load_episodes()
@@ -189,16 +200,41 @@ class LeRobotDataset(Dataset):
         import av
 
         container = av.open(video_path)
-        stream = container.streams.video[0]
-        target = set(frame_indices)
-        collected: dict[int, np.ndarray] = {}
+        try:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
 
-        for i, frame in enumerate(container.decode(stream)):
-            if i in target:
-                collected[i] = frame.to_ndarray(format="rgb24")
-            if i >= max(frame_indices):
-                break
-        container.close()
+            min_idx = min(frame_indices)
+            max_idx = max(frame_indices)
+            target = set(frame_indices)
+            collected: dict[int, np.ndarray] = {}
+
+            if min_idx > 30:
+                fps = float(stream.average_rate) if stream.average_rate else 30.0
+                seek_sec = max(0.0, (min_idx - 5) / fps)
+                container.seek(int(seek_sec * 1_000_000), any_frame=False)
+
+                frame_counter = None
+                for frame in container.decode(stream):
+                    if frame_counter is None:
+                        frame_counter = (
+                            round(float(frame.pts * stream.time_base) * fps)
+                            if frame.pts is not None
+                            else min_idx
+                        )
+                    if frame_counter in target:
+                        collected[frame_counter] = frame.to_ndarray(format="rgb24")
+                    if frame_counter >= max_idx:
+                        break
+                    frame_counter += 1
+            else:
+                for i, frame in enumerate(container.decode(stream)):
+                    if i in target:
+                        collected[i] = frame.to_ndarray(format="rgb24")
+                    if i >= max_idx:
+                        break
+        finally:
+            container.close()
 
         frames = []
         for idx in frame_indices:
@@ -223,18 +259,62 @@ class LeRobotDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @contextmanager
+    def _sample_timeout(self, idx):
+        if self.sample_timeout_sec <= 0 or os.name != "posix":
+            yield
+            return
+
+        def _handle_timeout(signum, frame):
+            raise TimeoutError(
+                f"Timed out after {self.sample_timeout_sec:.1f}s while loading sample idx={idx}"
+            )
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, self.sample_timeout_sec)
+        signal.signal(signal.SIGALRM, _handle_timeout)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0:
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    def _log_sample_error(self, idx, attempt, error):
+        if self._sample_error_logs >= 20:
+            return
+        self._sample_error_logs += 1
+        rank = os.environ.get("RANK", "?")
+        worker = "main"
+        try:
+            from torch.utils.data import get_worker_info
+
+            info = get_worker_info()
+            if info is not None:
+                worker = str(info.id)
+        except Exception:
+            pass
+        print(
+            f"[WARN] LeRobotDataset rank={rank} worker={worker} "
+            f"sample idx={idx} attempt={attempt + 1}/{self.max_sample_retries} "
+            f"failed, retrying with another idx: {type(error).__name__}: {error}",
+            flush=True,
+        )
+
     def __getitem__(self, idx):
-        for _attempt in range(10):
+        last_error = None
+        for _attempt in range(self.max_sample_retries):
             try:
-                return self._getitem_inner(idx)
+                with self._sample_timeout(idx):
+                    return self._getitem_inner(idx)
             except Exception as e:
-                if _attempt == 0 and os.environ.get("RANK", "0") == "0":
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        f"Dataset error at idx={idx}, retrying with random idx: {e}"
-                    )
+                last_error = e
+                self._log_sample_error(idx, _attempt, e)
                 idx = random.randint(0, len(self.samples) - 1)
-        return self._getitem_inner(idx)
+        raise RuntimeError(
+            f"Failed to load a valid LeRobot sample after {self.max_sample_retries} attempts"
+        ) from last_error
 
     def _getitem_inner(self, idx):
         ep_i, start = self.samples[idx]

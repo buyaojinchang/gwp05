@@ -1,11 +1,13 @@
 import json
 import os
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 from tqdm import tqdm
 
 
@@ -33,6 +35,34 @@ class ModuleDict(nn.ModuleDict):
 
     def forward(self, key, *args, **kwargs):
         return self[key](*args, **kwargs)
+
+
+def _install_process_group_timeout(timeout_sec) -> None:
+    if not timeout_sec:
+        return
+
+    timeout = timedelta(seconds=int(timeout_sec))
+    os.environ.setdefault("DEEPSPEED_TIMEOUT", str(max(1, int(timeout.total_seconds() // 60))))
+
+    try:
+        import torch.distributed as dist
+        import torch.distributed.distributed_c10d as c10d
+
+        dist.constants.default_pg_timeout = timeout
+        c10d.default_pg_timeout = timeout
+
+        if not hasattr(dist, "_gwp_original_new_group"):
+            dist._gwp_original_new_group = dist.new_group
+
+            def _new_group_with_default_timeout(*args, **kwargs):
+                if kwargs.get("timeout") is None:
+                    kwargs["timeout"] = getattr(dist, "_gwp_new_group_timeout", timeout)
+                return dist._gwp_original_new_group(*args, **kwargs)
+
+            dist.new_group = _new_group_with_default_timeout
+        dist._gwp_new_group_timeout = timeout
+    except Exception as exc:
+        print(f"[WARN] failed to install distributed timeout patch: {exc}", flush=True)
 
 
 class EMA:
@@ -140,9 +170,18 @@ class Trainer:
         )
 
         gradient_accumulation_steps = train_cfg.get("gradient_accumulation_steps", 1)
-        self.accelerator = Accelerator(
-            gradient_accumulation_steps=gradient_accumulation_steps,
+        timeout_sec = (
+            train_cfg.get("process_group_timeout_sec")
+            or os.environ.get("TORCH_DISTRIBUTED_TIMEOUT_SEC")
+            or os.environ.get("TORCH_NCCL_TIMEOUT_SEC")
         )
+        _install_process_group_timeout(timeout_sec)
+        accelerator_kwargs = {"gradient_accumulation_steps": gradient_accumulation_steps}
+        if timeout_sec:
+            accelerator_kwargs["kwargs_handlers"] = [
+                InitProcessGroupKwargs(timeout=timedelta(seconds=int(timeout_sec)))
+            ]
+        self.accelerator = Accelerator(**accelerator_kwargs)
 
         self.device = self.accelerator.device
         self.process_index = self.accelerator.process_index
@@ -312,6 +351,8 @@ class Trainer:
                 transform=transform,
                 t5_embed_path=dc.get("t5_embed_path"),
                 robotype=dc.get("robotype", "aloha"),
+                sample_timeout_sec=dl_cfg.get("sample_timeout_sec"),
+                max_sample_retries=dl_cfg.get("max_sample_retries"),
             )
 
         if len(data_configs) > 5:
@@ -334,14 +375,21 @@ class Trainer:
 
     def _build_dataloader(self, dataset):
         dl_cfg = self.config["dataloaders"]["train"]
-        return DataLoader(
-            dataset,
+        num_workers = dl_cfg.get("num_workers", 4)
+        kwargs = dict(
             batch_size=dl_cfg.get("batch_size_per_gpu", 1),
             shuffle=True,
-            num_workers=dl_cfg.get("num_workers", 4),
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
+            timeout=dl_cfg.get("timeout", 0),
         )
+        if num_workers > 0:
+            if "prefetch_factor" in dl_cfg:
+                kwargs["prefetch_factor"] = dl_cfg["prefetch_factor"]
+            if "persistent_workers" in dl_cfg:
+                kwargs["persistent_workers"] = dl_cfg["persistent_workers"]
+        return DataLoader(dataset, **kwargs)
 
     def run(self):
         project_dir = self.config.get("project_dir", "./output")
@@ -381,6 +429,7 @@ class Trainer:
 
         max_steps = self._resolved_max_steps
         checkpoint_interval = train_cfg.get("checkpoint_interval", 5000)
+        checkpoint_epoch_interval = int(train_cfg.get("checkpoint_epoch_interval", 0) or 0)
         log_interval = train_cfg.get("log_interval", 1)
         ema_cfg = train_cfg.get("ema", {}) or {}
         with_ema = bool(ema_cfg.get("enabled", train_cfg.get("with_ema", False)))
@@ -412,6 +461,13 @@ class Trainer:
 
         if train_cfg.get("resume", False):
             self.cur_step = self._try_resume(project_dir, ema)
+            if self.cur_step:
+                # Checkpoints store model/EMA/step, but not optimizer/scheduler state.
+                # Fast-forward the LR scheduler so resumed runs keep the original LR curve.
+                for _ in range(self.cur_step):
+                    scheduler.step()
+                if self.process_index == 0:
+                    print(f"Advanced scheduler to resumed step {self.cur_step}")
 
         self.model.train()
         if self.process_index == 0:
@@ -421,6 +477,7 @@ class Trainer:
         if self.process_index == 0:
             pbar = tqdm(initial=self.cur_step, total=max_steps, desc="Training", unit="step")
 
+        completed_epochs = 0
         while self.cur_step < max_steps:
             for batch in dataloader:
                 if self.cur_step >= max_steps:
@@ -457,10 +514,18 @@ class Trainer:
                 if pbar is not None:
                     pbar.update(1)
 
-                if self.cur_step % checkpoint_interval == 0:
+                if checkpoint_interval > 0 and self.cur_step % checkpoint_interval == 0:
                     self._save_checkpoint(project_dir, ema)
 
                 self._outputs.clear()
+
+            completed_epochs += 1
+            if (
+                checkpoint_epoch_interval > 0
+                and completed_epochs % checkpoint_epoch_interval == 0
+                and self.cur_step < max_steps
+            ):
+                self._save_checkpoint(project_dir, ema)
 
         if pbar is not None:
             pbar.close()
@@ -557,6 +622,7 @@ class Trainer:
             with open(os.path.join(save_dir, "checkpoint_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
             print(f"Checkpoint saved to {save_dir}")
+        self.accelerator.wait_for_everyone()
 
     def _try_resume(self, project_dir: str, ema: EMA | None = None) -> int:
         if not os.path.isdir(project_dir):

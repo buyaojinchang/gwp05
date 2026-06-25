@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -240,6 +241,8 @@ def sample_action(
     device = model_dict["device"]
     dtype = model_dict["dtype"]
     transformer = model_dict["transformer"]
+    if hasattr(transformer, "clear_action_only_cache"):
+        transformer.clear_action_only_cache()
     flow_shift = model_dict["flow_shift"]
     action_dim = model_dict["action_dim"]
     bs = ref_latents.shape[0]
@@ -354,6 +357,7 @@ class GWPPolicy:
             "observation.images.robot0_eye_in_hand",
             "observation.images.robot0_agentview_right",
         ]
+        self._infer_lock = threading.Lock()
 
     @torch.no_grad()
     def _get_prompt_embeds(self, obs: dict, device: str, dtype: torch.dtype) -> torch.Tensor:
@@ -399,6 +403,13 @@ class GWPPolicy:
 
     @torch.no_grad()
     def infer(self, obs: dict) -> dict:
+        # A server can accept multiple websocket clients. Keep model/cache/CUDA
+        # state serialized per GPU while the async server remains responsive.
+        with self._infer_lock:
+            return self._infer_unlocked(obs)
+
+    @torch.no_grad()
+    def _infer_unlocked(self, obs: dict) -> dict:
         device = self.model_dict["device"]
         dtype = self.model_dict["dtype"]
         vae = self.model_dict["vae"]

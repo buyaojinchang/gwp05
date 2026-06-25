@@ -153,8 +153,8 @@ def eval_env(
             action[4:5],    # control_mode
         ])
 
-    task_horizon = get_task_horizon(env_name)
-    horizon = int(task_horizon * 1.5)
+    # RoboCasa 1.0.1 stores the longer benchmark horizon directly in the registry.
+    horizon = int(get_task_horizon(env_name))
 
     now = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_path = f"{log_dir}/{env_name}/{now}"
