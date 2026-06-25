@@ -31,6 +31,11 @@ dependencies = [
     "pydantic>=2.0",
     "pynvml",
     "safetensors>=0.6.2",
+    # torch/torchvision need a CUDA-specific build. Install with the matching
+    # PyTorch index, e.g.:
+    #   pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
     "transformers>=4.57.1",
     "tyro",
     "wandb>=0.22.2",
