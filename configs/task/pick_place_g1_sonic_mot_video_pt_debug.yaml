@@ -1,0 +1,27 @@
+# @package _global_
+#
+# Single-GPU DEBUG version of stage-1 video pretrain.
+# Inherits pick_place_g1_sonic_mot_video_pt and shrinks everything for a fast
+# smoke run: batch=1, no grad-accum, capped at a handful of steps, frequent
+# logging/checkpoints. Override on the CLI, e.g. train.max_steps=5.
+
+defaults:
+  - pick_place_g1_sonic_mot_video_pt
+  - _self_
+
+exp_name: pick_place_g1_sonic_mot_video_pt_debug
+
+data:
+  batch_size_per_gpu: 1
+  num_workers: 2
+
+schedulers:
+  warmup_steps: 2
+
+train:
+  max_epochs: 0              # 0 -> use max_steps instead of full-epoch length
+  max_steps: 20
+  gradient_accumulation_steps: 1
+  log_interval: 1
+  checkpoint_interval: 10
+  checkpoint_epoch_interval: 0

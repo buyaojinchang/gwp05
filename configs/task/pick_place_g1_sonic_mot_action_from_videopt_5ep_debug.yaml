@@ -1,0 +1,28 @@
+# @package _global_
+#
+# Single-GPU DEBUG version of stage-2 action/joint training.
+# Inherits pick_place_g1_sonic_mot_action_from_videopt_5ep and shrinks everything
+# for a fast smoke run: batch=1, no grad-accum, capped at a handful of steps,
+# frequent logging/checkpoints. Still requires MOT_STAGE1_CHECKPOINT (stage-1 EMA
+# weights). Override on the CLI, e.g. train.max_steps=5.
+
+defaults:
+  - pick_place_g1_sonic_mot_action_from_videopt_5ep
+  - _self_
+
+exp_name: pick_place_g1_sonic_mot_action_from_videopt_5ep_debug
+
+data:
+  batch_size_per_gpu: 1
+  num_workers: 2
+
+schedulers:
+  warmup_steps: 2
+
+train:
+  max_epochs: 0              # 0 -> use max_steps instead of full-epoch length
+  max_steps: 20
+  gradient_accumulation_steps: 1
+  log_interval: 1
+  checkpoint_interval: 10
+  checkpoint_epoch_interval: 0
