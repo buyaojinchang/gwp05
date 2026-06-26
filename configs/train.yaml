@@ -53,10 +53,10 @@ train:
   with_ema: true
   ema:
     enabled: true
-    decay: 0.995              # target / upper-bound decay
+    decay: 0.9999             # target / upper-bound decay (~10k-step averaging window)
     device: model
     # dynamic (step-adaptive) decay schedule. dynamic=false -> constant `decay`.
-    dynamic: false
+    dynamic: true
     min_decay: 0.0            # lower bound while ramping up
     update_after_step: 0      # delay EMA start by N steps
     use_ema_warmup: false     # false: decay=(1+t)/(10+t); true: inv-gamma (diffusers)
