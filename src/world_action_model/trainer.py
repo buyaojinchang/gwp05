@@ -462,6 +462,42 @@ class Trainer:
             print(f"DataLoader config: {kwargs}", flush=True)
         return DataLoader(dataset, **kwargs)
 
+    def _dump_dataloader_worker_state(self):
+        state_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "gwp_dataloader_state")
+        if not os.path.isdir(state_dir):
+            print(f"[DataLoader debug] no worker state dir found: {state_dir}", flush=True)
+            return
+
+        state_files = sorted(
+            os.path.join(state_dir, name)
+            for name in os.listdir(state_dir)
+            if name.endswith(".json")
+        )
+        if not state_files:
+            print(f"[DataLoader debug] no worker state files found in {state_dir}", flush=True)
+            return
+
+        print(f"[DataLoader debug] last worker states from {state_dir}:", flush=True)
+        for path in state_files:
+            try:
+                with open(path) as f:
+                    state = json.load(f)
+                views = state.get("views", {})
+                view_text = "; ".join(
+                    f"{key}: {value.get('video_path')} frames={value.get('frame_indices')}"
+                    for key, value in views.items()
+                )
+                print(
+                    "[DataLoader debug] "
+                    f"rank={state.get('rank')} worker={state.get('worker')} pid={state.get('pid')} "
+                    f"time={state.get('time')} idx={state.get('idx')} "
+                    f"episode={state.get('episode_name')} start={state.get('start')} "
+                    f"len={state.get('episode_length')} {view_text}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[DataLoader debug] failed to read {path}: {exc}", flush=True)
+
     def run(self):
         project_dir = self.config.get("project_dir", "./output")
         os.makedirs(project_dir, exist_ok=True)
@@ -572,7 +608,16 @@ class Trainer:
 
         completed_epochs = 0
         while self.cur_step < max_steps:
-            for batch in dataloader:
+            dataloader_iter = iter(dataloader)
+            while self.cur_step < max_steps:
+                try:
+                    batch = next(dataloader_iter)
+                except StopIteration:
+                    break
+                except Exception:
+                    self._dump_dataloader_worker_state()
+                    raise
+
                 if self.cur_step >= max_steps:
                     break
 

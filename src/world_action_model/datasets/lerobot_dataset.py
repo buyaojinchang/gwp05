@@ -30,8 +30,11 @@ T5 embeddings can come from:
 import glob
 import json
 import os
+import faulthandler
 import random
 import signal
+import sys
+import time
 from contextlib import contextmanager
 
 import numpy as np
@@ -69,6 +72,9 @@ class LeRobotDataset(Dataset):
         self.sample_timeout_sec = float(sample_timeout_sec or 0)
         self.max_sample_retries = max(1, int(max_sample_retries or 1))
         self._sample_error_logs = 0
+        self._worker_state_dir = os.path.join(
+            os.environ.get("TMPDIR", "/tmp"), "gwp_dataloader_state"
+        )
 
         self.episodes: list[dict] = []
         self._load_episodes()
@@ -283,9 +289,15 @@ class LeRobotDataset(Dataset):
         previous_handler = signal.getsignal(signal.SIGALRM)
         previous_timer = signal.setitimer(signal.ITIMER_REAL, self.sample_timeout_sec)
         signal.signal(signal.SIGALRM, _handle_timeout)
+        faulthandler.dump_traceback_later(
+            self.sample_timeout_sec,
+            repeat=False,
+            file=sys.stderr,
+        )
         try:
             yield
         finally:
+            faulthandler.cancel_dump_traceback_later()
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
             if previous_timer[0] > 0:
@@ -312,6 +324,51 @@ class LeRobotDataset(Dataset):
             flush=True,
         )
 
+    def _write_worker_state(self, idx, ep_i, start):
+        try:
+            from torch.utils.data import get_worker_info
+
+            info = get_worker_info()
+            worker = "main" if info is None else str(info.id)
+        except Exception:
+            worker = "main"
+
+        ep = self.episodes[ep_i]
+        view_reads = {}
+        for view_key, offsets in self.frame_offsets.items():
+            frame_indices = [min(start + o, ep["length"] - 1) for o in offsets]
+            view_reads[view_key] = {
+                "video_path": os.path.join(
+                    self.root, "videos", ep["chunk"], view_key, f"{ep['name']}.mp4"
+                ),
+                "frame_indices": [int(i) for i in frame_indices],
+            }
+
+        state = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "pid": os.getpid(),
+            "rank": os.environ.get("RANK", "?"),
+            "worker": worker,
+            "idx": int(idx),
+            "episode_i": int(ep_i),
+            "episode_index": int(ep["index"]),
+            "episode_name": ep["name"],
+            "chunk": ep["chunk"],
+            "start": int(start),
+            "episode_length": int(ep["length"]),
+            "views": view_reads,
+        }
+
+        os.makedirs(self._worker_state_dir, exist_ok=True)
+        path = os.path.join(
+            self._worker_state_dir,
+            f"rank{state['rank']}_worker{worker}_pid{state['pid']}.json",
+        )
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+
     def __getitem__(self, idx):
         last_error = None
         for _attempt in range(self.max_sample_retries):
@@ -329,6 +386,7 @@ class LeRobotDataset(Dataset):
     def _getitem_inner(self, idx):
         ep_i, start = self.samples[idx]
         ep = self.episodes[ep_i]
+        self._write_worker_state(idx, ep_i, start)
 
         data_dict: dict = {}
 

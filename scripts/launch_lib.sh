@@ -18,6 +18,11 @@ print(":".join(libs))
 PY
 }
 
+gwp_has_libibverbs() {
+    ldconfig -p 2>/dev/null | grep -q 'libibverbs\.so' && return 0
+    find /usr/lib /usr/local/lib -name 'libibverbs.so*' -print -quit 2>/dev/null | grep -q .
+}
+
 gwp_setup_env() {
     export date="${date:-$(date +%m%d_%H%M)}"
     export CONDA_ENV="${CONDA_ENV:-/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/0_conda_env/gwp05}"
@@ -44,9 +49,19 @@ gwp_setup_env() {
     export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
     export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
     export TORCH_DISTRIBUTED_TIMEOUT_SEC="${TORCH_DISTRIBUTED_TIMEOUT_SEC:-3600}"
+    export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
     export WANDB_MODE="${WANDB_MODE:-offline}"
 
-    if [ "${GWP_SETUP_RDMA:-1}" = "1" ] && [ -d /sys/class/infiniband ]; then
+    if [ "${GWP_NCCL_DEBUG:-0}" != "1" ]; then
+        unset NCCL_DEBUG
+        unset TORCH_DISTRIBUTED_DEBUG
+        unset TORCH_NCCL_DESYNC_DEBUG
+        unset TORCH_NCCL_DUMP_ON_TIMEOUT
+        unset TORCH_NCCL_TRACE_BUFFER_SIZE
+        unset TORCH_FR_BUFFER_SIZE
+    fi
+
+    if [ "${GWP_SETUP_RDMA:-1}" = "1" ] && [ -d /sys/class/infiniband ] && gwp_has_libibverbs; then
         local rdma_ifs
         rdma_ifs="$(ls /sys/class/infiniband 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
         if [ -n "$rdma_ifs" ]; then
@@ -55,6 +70,8 @@ gwp_setup_env() {
             export NCCL_NET_GDR_LEVEL=2
             echo "  NCCL: RDMA enabled, IB HCA=$rdma_ifs"
         fi
+    elif [ -z "${NCCL_IB_DISABLE:-}" ]; then
+        export NCCL_IB_DISABLE=1
     fi
 }
 

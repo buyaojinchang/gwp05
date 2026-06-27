@@ -18,6 +18,7 @@ import sys
 
 import hydra
 from omegaconf import DictConfig
+from torch.distributed.elastic.multiprocessing.errors import record
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
@@ -32,6 +33,7 @@ register_default_resolvers()
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
+@record
 def main(cfg: DictConfig) -> None:
     run_training(cfg)
 
