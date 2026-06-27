@@ -22,7 +22,7 @@
 # indices.
 
 layout: task_list
-data_root: ${oc.env:PICK_PLACE_ROOT,/home/s4090/hengtao.li/2_data_ckpt_cache/locomanip/data}
+data_root: ${oc.env:PICK_PLACE_ROOT,/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/2_data_ckpt_cache/loco_manip/data}
 task_names:
   - pick_place_gwp
 norm_path: ${data.data_root}/pick_place_gwp/norm_stats_delta.json

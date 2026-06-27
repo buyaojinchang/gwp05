@@ -129,3 +129,4 @@ gmon.out
 
 logs/
 *.txt
+core.*

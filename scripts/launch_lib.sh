@@ -1,42 +1,37 @@
 #!/usr/bin/env bash
-# Shared launch helpers for gwp-mot Hydra training scripts.
-#
-# Usage from a thin wrapper (in the repo root):
-#   export GWP_DEFAULT_NPROC=8            # default GPUs/proc when not on platform
-#   export MASTER_PORT="${MASTER_PORT:-29500}"
-#   source "$(dirname "${BASH_SOURCE[0]}")/scripts/launch_lib.sh"
-#   gwp_launch <task_name> [extra hydra overrides...]
-#
-# Tunables honored via env (all optional):
-#   CUDA_VISIBLE_DEVICES, NUM_NODES/NODE_RANK/NPROC_PER_NODE (or MLP_* on platform),
-#   MASTER_ADDR/MASTER_PORT, GWP_MOT_OUTPUT_ROOT, GWP_MOT_TMPDIR, WANDB_MODE,
-#   ACCEL_CONFIG, CONDA_ENV.
-
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-gwp_setup_rdma() {
-    local rdma_ifs rdma_net
-    rdma_ifs=$(ls /sys/class/infiniband/ 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-    if [ -n "$rdma_ifs" ]; then
-        export NCCL_IB_DISABLE=0
-        export NCCL_IB_HCA="$rdma_ifs"
-        export NCCL_NET_GDR_LEVEL=2
-        echo "  NCCL: RDMA enabled, IB HCA=$rdma_ifs"
-        return
-    fi
-    rdma_net=$(ip link show 2>/dev/null | grep -E 'rdma|roce|ib' | awk -F: '{print $2}' | tr -d ' ' | head -1)
-    if [ -n "$rdma_net" ]; then
-        export NCCL_IB_DISABLE=0
-        export NCCL_SOCKET_IFNAME="$rdma_net"
-        echo "  NCCL: RDMA net interface=$rdma_net"
-    fi
+gwp_python_nvidia_libs() {
+    "$CONDA_ENV/bin/python" - <<'PY'
+from pathlib import Path
+import site
+
+libs = []
+for sp in site.getsitepackages():
+    root = Path(sp) / "nvidia"
+    if root.exists():
+        libs += [str(p) for p in root.glob("*/lib") if p.is_dir()]
+
+print(":".join(libs))
+PY
 }
 
 gwp_setup_env() {
     export date="${date:-$(date +%m%d_%H%M)}"
-    export GWP_MOT_OUTPUT_ROOT="${GWP_MOT_OUTPUT_ROOT:-/shared_disk/users/hengtao.li/codex/gwp-mot}"
+    export CONDA_ENV="${CONDA_ENV:-/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/0_conda_env/gwp05}"
+    export GWP_MOT_OUTPUT_ROOT="${GWP_MOT_OUTPUT_ROOT:-/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/2_data_ckpt_cache/loco_manip/experiments}"
+
+    [ -x "$CONDA_ENV/bin/python" ] || { echo "ERROR: missing $CONDA_ENV/bin/python" >&2; exit 1; }
+    [ -x "$CONDA_ENV/bin/accelerate" ] || { echo "ERROR: missing $CONDA_ENV/bin/accelerate" >&2; exit 1; }
+
+    export CONDA_PREFIX="$CONDA_ENV"
+    export PATH="$CONDA_ENV/bin:$PATH"
+
+    local py_nvidia_libs
+    py_nvidia_libs="$(gwp_python_nvidia_libs)"
+    export LD_LIBRARY_PATH="${py_nvidia_libs:+$py_nvidia_libs:}$CONDA_ENV/lib:$CONDA_ENV/lib64:${LD_LIBRARY_PATH:-}"
 
     NUM_NODES="${MLP_WORKER_NUM:-${NUM_NODES:-1}}"
     NODE_RANK="${MLP_ROLE_INDEX:-${NODE_RANK:-0}}"
@@ -51,37 +46,48 @@ gwp_setup_env() {
     export TORCH_DISTRIBUTED_TIMEOUT_SEC="${TORCH_DISTRIBUTED_TIMEOUT_SEC:-3600}"
     export WANDB_MODE="${WANDB_MODE:-offline}"
 
-    [ "${GWP_SETUP_RDMA:-1}" = "1" ] && gwp_setup_rdma || true
-
-    eval "$(conda shell.bash hook 2>/dev/null)" || true
-    conda activate "${CONDA_ENV:-/mnt/pfs/users/hengtao.li/conda_envs/gwpmot}" 2>/dev/null || true
+    if [ "${GWP_SETUP_RDMA:-1}" = "1" ] && [ -d /sys/class/infiniband ]; then
+        local rdma_ifs
+        rdma_ifs="$(ls /sys/class/infiniband 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+        if [ -n "$rdma_ifs" ]; then
+            export NCCL_IB_DISABLE=0
+            export NCCL_IB_HCA="$rdma_ifs"
+            export NCCL_NET_GDR_LEVEL=2
+            echo "  NCCL: RDMA enabled, IB HCA=$rdma_ifs"
+        fi
+    fi
 }
 
 gwp_launch() {
-    local task="$1"; shift
+    local task="$1"
+    shift
+
     gwp_setup_env
     cd "$REPO_ROOT"
 
     local log_dir="$GWP_MOT_OUTPUT_ROOT/logs/$task"
     local log_file="$log_dir/${date}_node${NODE_RANK}.log"
-    export TMPDIR="${GWP_MOT_TMPDIR:-/tmp/gwp-mot/${task}_${date}_node${NODE_RANK}_$$}"
-    mkdir -p "$log_dir" "$TMPDIR"
+    mkdir -p "$log_dir"
+
+    export TMPDIR="${GWP_MOT_TMPDIR:-/tmp/gwp/n${NODE_RANK}_$$}"
+    export TMP="$TMPDIR"
+    export TEMP="$TMPDIR"
+    mkdir -p "$TMPDIR"
 
     local accel_config="${ACCEL_CONFIG:-scripts/accelerate_configs/config_deepspeed_zero2.json}"
+    local -a gpu_args=()
+    [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && gpu_args=(--gpu_ids "$CUDA_VISIBLE_DEVICES")
 
     echo "=== gwp-mot launch: task=$task ==="
-    echo "  REPO_ROOT=$REPO_ROOT"
     echo "  NPROC_PER_NODE=$NPROC_PER_NODE TOTAL_PROCS=$TOTAL_PROCS NODE_RANK=$NODE_RANK/$NUM_NODES"
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}"
-    echo "  MASTER=$MASTER_ADDR:$MASTER_PORT  WANDB_MODE=$WANDB_MODE"
-    echo "  ACCEL_CONFIG=$accel_config"
-    echo "  hydra overrides: $*"
+    echo "  MASTER=$MASTER_ADDR:$MASTER_PORT"
     echo "  LOG=$log_file"
     echo "================================"
 
-    accelerate launch \
+    "$CONDA_ENV/bin/accelerate" launch \
         --config_file "$accel_config" \
-        ${CUDA_VISIBLE_DEVICES:+--gpu_ids "$CUDA_VISIBLE_DEVICES"} \
+        "${gpu_args[@]}" \
         --num_processes "$TOTAL_PROCS" \
         --num_machines "$NUM_NODES" \
         --machine_rank "$NODE_RANK" \

@@ -2,7 +2,7 @@
 # action_dim / state_dim are pulled from the selected data group so they are
 # defined in exactly one place.
 
-pretrained: ${oc.env:WAN22_DIFFUSERS_PATH,/home/s4090/hengtao.li/2_data_ckpt_cache/locomanip/pretrained_ckpt/Wan2.2-TI2V-5B-Diffusers}
+pretrained: ${oc.env:WAN22_DIFFUSERS_PATH,/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/2_data_ckpt_cache/loco_manip/pretrained_ckpts/Wan2.2-TI2V-5B-Diffusers}
 checkpoint: null
 strict: false
 type: mot

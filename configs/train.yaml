@@ -15,7 +15,7 @@ defaults:
 # --- experiment identity / output ---
 exp_name: gwp_mot
 date_str: ${oc.env:date,default}
-output_root: ${oc.env:GWP_MOT_OUTPUT_ROOT,/shared_disk/users/hengtao.li/codex/gwp-mot}
+output_root: ${oc.env:GWP_MOT_OUTPUT_ROOT,/inspire/hdd/project/robot-dna/sunmingyang-240108120101/wam_locomanip/2_data_ckpt_cache/loco_manip/experiments}
 project_dir: ${output_root}/experiments/${exp_name}_${date_str}
 
 # trainer class (resolved by name in world_action_model)

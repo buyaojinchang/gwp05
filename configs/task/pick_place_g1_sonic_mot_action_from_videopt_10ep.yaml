@@ -13,7 +13,7 @@ defaults:
   - pick_place_g1_sonic_mot
   - _self_
 
-exp_name: pick_place_g1_sonic_mot_action_from_videopt_5ep
+exp_name: pick_place_g1_sonic_mot_action_from_videopt_10ep
 date_str: ${oc.env:date,action5ep}
 
 model:
@@ -27,15 +27,13 @@ model:
   #   freeze_backbone: true
   #   visual_loss_weight: 0.0
 
-wandb:
-  mode: ${oc.env:WANDB_MODE,online}
-
 schedulers:
-  decay_epochs: 5
+  decay_epochs: 10
 
 train:
+  max_epochs: 10
+  gradient_accumulation_steps: 2
   resume: false
-  max_epochs: ${oc.decode:${oc.env:GWP_MAX_EPOCHS,5}}
   max_steps: ${oc.decode:${oc.env:GWP_MAX_STEPS,0}}
   checkpoint_interval: ${oc.decode:${oc.env:GWP_CHECKPOINT_INTERVAL,5000}}
   checkpoint_epoch_interval: 1
