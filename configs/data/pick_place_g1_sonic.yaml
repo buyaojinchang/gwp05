@@ -40,7 +40,12 @@ view_keys:
   - observation.images.ego_view
 
 batch_size_per_gpu: 4
-num_workers: 8
+num_workers: 2
+sample_timeout_sec: 120
+max_sample_retries: 5
+timeout: 300
+prefetch_factor: 2
+persistent_workers: true
 
 dataset:
   class_name: LeRobotDataset

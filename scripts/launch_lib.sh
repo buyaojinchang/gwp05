@@ -82,6 +82,9 @@ gwp_launch() {
     echo "  NPROC_PER_NODE=$NPROC_PER_NODE TOTAL_PROCS=$TOTAL_PROCS NODE_RANK=$NODE_RANK/$NUM_NODES"
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}"
     echo "  MASTER=$MASTER_ADDR:$MASTER_PORT"
+    echo "  CONDA_ENV=$CONDA_ENV"
+    echo "  PICK_PLACE_ROOT=${PICK_PLACE_ROOT:-<config default>}"
+    echo "  WAN22_DIFFUSERS_PATH=${WAN22_DIFFUSERS_PATH:-<config default>}"
     echo "  LOG=$log_file"
     echo "================================"
 

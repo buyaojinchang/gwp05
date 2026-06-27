@@ -1,20 +1,20 @@
 # @package _global_
 #
 # Stage 2 — action/joint training from the stage-1 video-pretrain EMA checkpoint.
-# Unfreeze the action expert and run a fresh 5-epoch joint run (video + action
+# Unfreeze the action expert and run a fresh 10-epoch joint run (video + action
 # losses both on). Initialized from MOT_STAGE1_CHECKPOINT (weights only, not a
 # resume of the old accelerate state).
 #
 # 8-GPU launch:
 #   export MOT_STAGE1_CHECKPOINT=.../pick_place_g1_sonic_mot_video_pt_<date>/checkpoint-<step>/model_ema.pt
-#   bash train_pick_place_g1_sonic_mot_action_from_videopt_5ep_g8.sh
+#   bash train_pick_place_g1_sonic_mot_action_from_videopt_10ep_g8.sh
 
 defaults:
   - pick_place_g1_sonic_mot
   - _self_
 
 exp_name: pick_place_g1_sonic_mot_action_from_videopt_10ep
-date_str: ${oc.env:date,action5ep}
+date_str: ${oc.env:date,action10ep}
 
 model:
   checkpoint: ${oc.env:MOT_STAGE1_CHECKPOINT}
@@ -34,6 +34,6 @@ train:
   max_epochs: 10
   gradient_accumulation_steps: 2
   resume: false
-  max_steps: ${oc.decode:${oc.env:GWP_MAX_STEPS,0}}
-  checkpoint_interval: ${oc.decode:${oc.env:GWP_CHECKPOINT_INTERVAL,5000}}
+  max_steps: 0
+  checkpoint_interval: 5000
   checkpoint_epoch_interval: 1

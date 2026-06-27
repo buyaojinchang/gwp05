@@ -435,20 +435,31 @@ class Trainer:
 
     def _build_dataloader(self, dataset):
         dl_cfg = self.config["dataloaders"]["train"]
-        num_workers = dl_cfg.get("num_workers", 4)
+
+        def _as_bool(value) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+
+        num_workers = int(dl_cfg.get("num_workers", 4))
+        timeout = int(float(dl_cfg.get("timeout", 0) or 0))
+        if num_workers <= 0:
+            timeout = 0
         kwargs = dict(
-            batch_size=dl_cfg.get("batch_size_per_gpu", 1),
+            batch_size=int(dl_cfg.get("batch_size_per_gpu", 1)),
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            timeout=dl_cfg.get("timeout", 0),
+            timeout=timeout,
         )
         if num_workers > 0:
             if "prefetch_factor" in dl_cfg:
-                kwargs["prefetch_factor"] = dl_cfg["prefetch_factor"]
+                kwargs["prefetch_factor"] = int(dl_cfg["prefetch_factor"])
             if "persistent_workers" in dl_cfg:
-                kwargs["persistent_workers"] = dl_cfg["persistent_workers"]
+                kwargs["persistent_workers"] = _as_bool(dl_cfg["persistent_workers"])
+        if self.process_index == 0:
+            print(f"DataLoader config: {kwargs}", flush=True)
         return DataLoader(dataset, **kwargs)
 
     def run(self):
