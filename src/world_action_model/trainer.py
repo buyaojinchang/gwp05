@@ -589,14 +589,16 @@ class Trainer:
             )
 
         if train_cfg.get("resume", False):
-            self.cur_step = self._try_resume(project_dir, ema)
+            self._resume_restored_scheduler = False
+            self.cur_step = self._try_resume(project_dir, ema, optimizer, scheduler)
             if self.cur_step:
-                # Checkpoints store model/EMA/step, but not optimizer/scheduler state.
-                # Fast-forward the LR scheduler so resumed runs keep the original LR curve.
-                for _ in range(self.cur_step):
-                    scheduler.step()
-                if self.process_index == 0:
-                    print(f"Advanced scheduler to resumed step {self.cur_step}")
+                if not getattr(self, "_resume_restored_scheduler", False):
+                    # Legacy checkpoints store model/EMA/step, but not scheduler state.
+                    # Fast-forward the LR scheduler so resumed runs keep the original LR curve.
+                    for _ in range(self.cur_step):
+                        scheduler.step()
+                    if self.process_index == 0:
+                        print(f"Advanced scheduler to resumed step {self.cur_step}")
 
         self.model.train()
         if self.process_index == 0:
@@ -654,7 +656,7 @@ class Trainer:
                     pbar.update(1)
 
                 if checkpoint_interval > 0 and self.cur_step % checkpoint_interval == 0:
-                    self._save_checkpoint(project_dir, ema)
+                    self._save_checkpoint(project_dir, ema, optimizer, scheduler)
 
                 self._outputs.clear()
 
@@ -664,12 +666,12 @@ class Trainer:
                 and completed_epochs % checkpoint_epoch_interval == 0
                 and self.cur_step < max_steps
             ):
-                self._save_checkpoint(project_dir, ema)
+                self._save_checkpoint(project_dir, ema, optimizer, scheduler)
 
         if pbar is not None:
             pbar.close()
 
-        self._save_checkpoint(project_dir, ema)
+        self._save_checkpoint(project_dir, ema, optimizer, scheduler)
         self.accelerator.end_training()
         if self.process_index == 0:
             wandb.finish()
@@ -719,12 +721,34 @@ class Trainer:
             return state_dict["model_state_dict"]
         return state_dict
 
-    def _save_checkpoint(self, project_dir: str, ema: EMA | None = None):
+    def _save_checkpoint(
+        self,
+        project_dir: str,
+        ema: EMA | None = None,
+        optimizer: torch.optim.Optimizer | None = None,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    ):
         self.accelerator.wait_for_everyone()
         save_dir = os.path.join(project_dir, f"checkpoint-{self.cur_step}")
 
         if self.process_index == 0:
             os.makedirs(save_dir, exist_ok=True)
+        self.accelerator.wait_for_everyone()
+
+        train_cfg = self.config.get("train", {})
+        save_full_state = bool(train_cfg.get("save_full_state", True))
+        full_state_saved = False
+        if save_full_state:
+            full_state_dir = os.path.join(save_dir, "accelerator_state")
+            try:
+                self.accelerator.save_state(full_state_dir)
+                full_state_saved = True
+            except Exception as exc:
+                if self.process_index == 0:
+                    print(f"[WARN] Failed to save full accelerator state: {exc}", flush=True)
+        self.accelerator.wait_for_everyone()
+
+        if self.process_index == 0:
             unwrapped = self.accelerator.unwrap_model(self.model)
             trainable_names = self._trainable_floating_param_names(unwrapped)
             raw_state = self._state_dict_for_save(unwrapped, fp32_names=trainable_names)
@@ -742,13 +766,21 @@ class Trainer:
                 },
                 os.path.join(save_dir, "training_state.pt"),
             )
+            if scheduler is not None:
+                torch.save(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+
             meta = {
                 "format": "world_action_model_full_checkpoint",
                 "raw_model_path": "model.pt",
                 "raw_fp32_trainable": True,
                 "num_trainable_tensors": len(trainable_names),
                 "ema_enabled": ema is not None,
+                "full_accelerator_state": full_state_saved,
             }
+            if full_state_saved:
+                meta["full_state_path"] = "accelerator_state"
+            if scheduler is not None:
+                meta["scheduler_state_path"] = "scheduler.pt"
             if ema is not None:
                 meta.update({
                     "ema_model_path": "model_ema.pt",
@@ -763,7 +795,13 @@ class Trainer:
             print(f"Checkpoint saved to {save_dir}")
         self.accelerator.wait_for_everyone()
 
-    def _try_resume(self, project_dir: str, ema: EMA | None = None) -> int:
+    def _try_resume(
+        self,
+        project_dir: str,
+        ema: EMA | None = None,
+        optimizer: torch.optim.Optimizer | None = None,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    ) -> int:
         if not os.path.isdir(project_dir):
             return 0
 
@@ -777,12 +815,34 @@ class Trainer:
         latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
         ckpt_dir = os.path.join(project_dir, latest)
 
+        full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
+        full_state_loaded = False
+        if os.path.isdir(full_state_dir):
+            if self.process_index == 0:
+                print(f"Loading full accelerator state from {full_state_dir}")
+            self.accelerator.load_state(full_state_dir)
+            full_state_loaded = True
+        elif self.process_index == 0:
+            print(
+                f"[WARN] No full accelerator state found in {ckpt_dir}; "
+                "resuming model weights only, with a fresh optimizer state.",
+                flush=True,
+            )
+
         model_path = os.path.join(ckpt_dir, "model.pt")
-        if os.path.exists(model_path):
+        if not full_state_loaded and os.path.exists(model_path):
             state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
             state_dict = self._extract_model_state(state_dict)
             unwrapped = self.accelerator.unwrap_model(self.model)
             unwrapped.load_state_dict(state_dict, strict=False)
+
+        scheduler_path = os.path.join(ckpt_dir, "scheduler.pt")
+        if scheduler is not None and os.path.exists(scheduler_path):
+            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+            scheduler.load_state_dict(scheduler_state)
+            self._resume_restored_scheduler = True
+            if self.process_index == 0:
+                print(f"Loaded scheduler state from {scheduler_path}")
 
         step = 0
         state_path = os.path.join(ckpt_dir, "training_state.pt")

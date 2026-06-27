@@ -46,6 +46,7 @@ train:
   gradient_accumulation_steps: 2
   mixed_precision: bf16
   checkpoint_interval: 5000
+  save_full_state: true
   checkpoint_total_limit: -1
   checkpoint_safe_serialization: false
   checkpoint_strict: false
