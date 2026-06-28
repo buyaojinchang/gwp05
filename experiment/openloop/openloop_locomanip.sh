@@ -46,6 +46,33 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
     PYTHON_BIN="$(command -v python)"
 fi
 
+setup_python_cuda_libs() {
+    local python_bin="$1"
+    local env_root
+    env_root="$(cd "$(dirname "$python_bin")/.." && pwd)"
+
+    local py_nvidia_libs
+    py_nvidia_libs="$("$python_bin" - <<'PY' 2>/dev/null || true
+from pathlib import Path
+import site
+
+libs = []
+for sp in site.getsitepackages():
+    root = Path(sp) / "nvidia"
+    if root.exists():
+        libs += [str(p) for p in root.glob("*/lib") if p.is_dir()]
+
+print(":".join(libs))
+PY
+)"
+
+    export CONDA_PREFIX="${CONDA_PREFIX:-$env_root}"
+    export PATH="$env_root/bin:$PATH"
+    export LD_LIBRARY_PATH="${py_nvidia_libs:+$py_nvidia_libs:}$env_root/lib:$env_root/lib64:${LD_LIBRARY_PATH:-}"
+}
+
+setup_python_cuda_libs "$PYTHON_BIN"
+
 echo "============================================================"
 echo "  MoT Open-Loop Evaluation [locomanip pick_place G1 sonic]"
 echo "  Checkpoint:        $CHECKPOINT"
