@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from datetime import timedelta
 
 import torch
@@ -721,6 +722,19 @@ class Trainer:
             return state_dict["model_state_dict"]
         return state_dict
 
+    @staticmethod
+    def _torch_save_atomic(obj, path: str) -> None:
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        try:
+            torch.save(obj, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     def _save_checkpoint(
         self,
         project_dir: str,
@@ -736,30 +750,25 @@ class Trainer:
         self.accelerator.wait_for_everyone()
 
         train_cfg = self.config.get("train", {})
-        save_full_state = bool(train_cfg.get("save_full_state", True))
-        full_state_saved = False
-        if save_full_state:
-            full_state_dir = os.path.join(save_dir, "accelerator_state")
-            try:
-                self.accelerator.save_state(full_state_dir)
-                full_state_saved = True
-            except Exception as exc:
-                if self.process_index == 0:
-                    print(f"[WARN] Failed to save full accelerator state: {exc}", flush=True)
-        self.accelerator.wait_for_everyone()
+        save_full_state_value = train_cfg.get("save_full_state", False)
+        if isinstance(save_full_state_value, str):
+            save_full_state = save_full_state_value.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            save_full_state = bool(save_full_state_value)
+        meta_path = os.path.join(save_dir, "checkpoint_meta.json")
 
         if self.process_index == 0:
             unwrapped = self.accelerator.unwrap_model(self.model)
             trainable_names = self._trainable_floating_param_names(unwrapped)
             raw_state = self._state_dict_for_save(unwrapped, fp32_names=trainable_names)
-            torch.save(raw_state, os.path.join(save_dir, "model.pt"))
+            self._torch_save_atomic(raw_state, os.path.join(save_dir, "model.pt"))
 
             if ema is not None:
                 ema_state = self._state_dict_with_ema(unwrapped, ema, fp32_names=ema.tracked_names)
-                torch.save(ema_state, os.path.join(save_dir, "model_ema.pt"))
-                torch.save(ema.state_dict(cpu=True), os.path.join(save_dir, "ema_state.pt"))
+                self._torch_save_atomic(ema_state, os.path.join(save_dir, "model_ema.pt"))
+                self._torch_save_atomic(ema.state_dict(cpu=True), os.path.join(save_dir, "ema_state.pt"))
 
-            torch.save(
+            self._torch_save_atomic(
                 {
                     "cur_step": self.cur_step,
                     "ema_updates": ema.updates if ema is not None else 0,
@@ -767,7 +776,7 @@ class Trainer:
                 os.path.join(save_dir, "training_state.pt"),
             )
             if scheduler is not None:
-                torch.save(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+                self._torch_save_atomic(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
 
             meta = {
                 "format": "world_action_model_full_checkpoint",
@@ -775,10 +784,8 @@ class Trainer:
                 "raw_fp32_trainable": True,
                 "num_trainable_tensors": len(trainable_names),
                 "ema_enabled": ema is not None,
-                "full_accelerator_state": full_state_saved,
+                "full_accelerator_state": False,
             }
-            if full_state_saved:
-                meta["full_state_path"] = "accelerator_state"
             if scheduler is not None:
                 meta["scheduler_state_path"] = "scheduler.pt"
             if ema is not None:
@@ -790,9 +797,36 @@ class Trainer:
                     "ema_fp32_trainable": True,
                     "ema_tracked_tensors": len(ema.tracked_names),
                 })
-            with open(os.path.join(save_dir, "checkpoint_meta.json"), "w") as f:
+            with open(meta_path, "w") as f:
                 json.dump(meta, f, indent=2)
             print(f"Checkpoint saved to {save_dir}")
+        self.accelerator.wait_for_everyone()
+
+        full_state_saved = False
+        full_state_dir = os.path.join(save_dir, "accelerator_state")
+        if save_full_state:
+            try:
+                self.accelerator.save_state(full_state_dir)
+                full_state_saved = True
+            except Exception as exc:
+                if self.process_index == 0:
+                    print(f"[WARN] Failed to save full accelerator state: {exc}", flush=True)
+        self.accelerator.wait_for_everyone()
+
+        if save_full_state and not full_state_saved and self.process_index == 0:
+            shutil.rmtree(full_state_dir, ignore_errors=True)
+
+        if full_state_saved and self.process_index == 0:
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                meta["full_accelerator_state"] = True
+                meta["full_state_path"] = "accelerator_state"
+                with open(meta_path, "w") as f:
+                    json.dump(meta, f, indent=2)
+                print(f"Full accelerator state saved to {full_state_dir}")
+            except Exception as exc:
+                print(f"[WARN] Failed to update full-state checkpoint metadata: {exc}", flush=True)
         self.accelerator.wait_for_everyone()
 
     def _try_resume(
@@ -805,14 +839,33 @@ class Trainer:
         if not os.path.isdir(project_dir):
             return 0
 
-        checkpoints = [
-            d for d in os.listdir(project_dir)
-            if d.startswith("checkpoint-") and os.path.isdir(os.path.join(project_dir, d))
-        ]
+        checkpoints = []
+        for name in os.listdir(project_dir):
+            ckpt_dir = os.path.join(project_dir, name)
+            if not name.startswith("checkpoint-") or not os.path.isdir(ckpt_dir):
+                continue
+            try:
+                step_num = int(name.split("-")[1])
+            except (IndexError, ValueError):
+                continue
+            checkpoints.append((step_num, name))
         if not checkpoints:
             return 0
 
-        latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+        latest = None
+        for _, name in sorted(checkpoints, reverse=True):
+            ckpt_dir = os.path.join(project_dir, name)
+            model_path = os.path.join(ckpt_dir, "model.pt")
+            state_path = os.path.join(ckpt_dir, "training_state.pt")
+            full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
+            if os.path.exists(state_path) and (os.path.exists(model_path) or os.path.isdir(full_state_dir)):
+                latest = name
+                break
+            if self.process_index == 0:
+                print(f"[WARN] Skipping incomplete checkpoint: {ckpt_dir}", flush=True)
+        if latest is None:
+            return 0
+
         ckpt_dir = os.path.join(project_dir, latest)
 
         full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
