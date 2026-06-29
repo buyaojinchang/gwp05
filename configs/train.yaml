@@ -50,6 +50,7 @@ train:
   checkpoint_total_limit: -1
   checkpoint_safe_serialization: false
   checkpoint_strict: false
+  dataloader_timeout_retries: 20
   log_interval: 2
   with_ema: true
   ema:

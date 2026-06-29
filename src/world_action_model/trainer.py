@@ -1,4 +1,5 @@
 import json
+import gc
 import os
 import shutil
 from datetime import timedelta
@@ -515,7 +516,44 @@ class Trainer:
                     flush=True,
                 )
             except Exception as exc:
-                print(f"[DataLoader debug] failed to read {path}: {exc}", flush=True)
+                print(f"[DataLoader debug] failed to format worker state: {exc}", flush=True)
+
+    @staticmethod
+    def _is_dataloader_timeout_error(error: Exception) -> bool:
+        return "DataLoader timed out" in str(error)
+
+    def _sync_dataloader_fetch_status(self, local_status: int) -> int:
+        """Synchronize dataloader fetch status across ranks.
+
+        Status values:
+          0: batch fetched
+          1: dataloader exhausted
+          2: dataloader timeout; discard fetched batches and retry
+          3: fatal fetch error
+        """
+        try:
+            import torch.distributed as dist
+
+            if not dist.is_available() or not dist.is_initialized():
+                return int(local_status)
+
+            status = torch.tensor([int(local_status)], device=self.accelerator.device)
+            dist.all_reduce(status, op=dist.ReduceOp.MAX)
+            return int(status.item())
+        except Exception as exc:
+            if self.process_index == 0:
+                print(f"[WARN] Failed to sync dataloader fetch status: {exc}", flush=True)
+            return max(int(local_status), 3)
+
+    @staticmethod
+    def _shutdown_dataloader_iter(dataloader_iter) -> None:
+        shutdown = getattr(dataloader_iter, "_shutdown_workers", None)
+        if shutdown is None:
+            return
+        try:
+            shutdown()
+        except Exception:
+            pass
 
     def _find_latest_checkpoint(self, project_dir: str) -> str | None:
         if not os.path.isdir(project_dir):
@@ -686,19 +724,64 @@ class Trainer:
             pbar = tqdm(initial=self.cur_step, total=max_steps, desc="Training", unit="step")
 
         completed_epochs = 0
+        dataloader_timeout_retries = int(train_cfg.get("dataloader_timeout_retries", 0) or 0)
+        dataloader_timeout_streak = 0
+        dataloader_timeout_total = 0
         while self.cur_step < max_steps:
             dataloader_iter = iter(dataloader)
             while self.cur_step < max_steps:
+                batch = None
+                fetch_error = None
+                local_fetch_status = 0
                 try:
                     batch = next(dataloader_iter)
                 except StopIteration:
+                    local_fetch_status = 1
+                except Exception as exc:
+                    fetch_error = exc
+                    local_fetch_status = 2 if self._is_dataloader_timeout_error(exc) else 3
+
+                fetch_status = (
+                    self._sync_dataloader_fetch_status(local_fetch_status)
+                    if dataloader_timeout_retries > 0
+                    else local_fetch_status
+                )
+                if fetch_status == 1:
                     break
-                except Exception:
-                    self._dump_dataloader_worker_state()
-                    raise
+                if fetch_status == 2:
+                    if fetch_error is not None:
+                        self._dump_dataloader_worker_state()
+                    dataloader_timeout_streak += 1
+                    dataloader_timeout_total += 1
+                    if self.process_index == 0:
+                        print(
+                            "[WARN] DataLoader timed out on at least one rank; "
+                            f"discarding this fetch and rebuilding iterator "
+                            f"(streak={dataloader_timeout_streak}/"
+                            f"{dataloader_timeout_retries}, total={dataloader_timeout_total}).",
+                            flush=True,
+                        )
+                    if dataloader_timeout_streak > dataloader_timeout_retries:
+                        raise RuntimeError(
+                            "Exceeded dataloader_timeout_retries="
+                            f"{dataloader_timeout_retries}"
+                        ) from fetch_error
+                    batch = None
+                    self._shutdown_dataloader_iter(dataloader_iter)
+                    dataloader_iter = None
+                    gc.collect()
+                    dataloader_iter = iter(dataloader)
+                    continue
+                if fetch_status == 3:
+                    if fetch_error is not None:
+                        self._dump_dataloader_worker_state()
+                        raise fetch_error
+                    raise RuntimeError("Another rank failed while fetching a dataloader batch")
 
                 if self.cur_step >= max_steps:
                     break
+
+                dataloader_timeout_streak = 0
 
                 with self.accelerator.accumulate(self.model):
                     losses = self.forward_step(batch)
