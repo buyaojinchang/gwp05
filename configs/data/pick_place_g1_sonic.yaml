@@ -45,11 +45,11 @@ sample_timeout_sec: 120
 max_sample_retries: 5
 timeout: 300
 prefetch_factor: 2
-persistent_workers: true
+persistent_workers: false
 
 dataset:
   class_name: LeRobotDataset
-  video_backend: pyav
+  video_backend: decord
   robotype: g1_sonic
 
 transform:

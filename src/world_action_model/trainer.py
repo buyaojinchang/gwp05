@@ -478,11 +478,29 @@ class Trainer:
             print(f"[DataLoader debug] no worker state files found in {state_dir}", flush=True)
             return
 
-        print(f"[DataLoader debug] last worker states from {state_dir}:", flush=True)
+        latest_by_worker = {}
         for path in state_files:
             try:
                 with open(path) as f:
                     state = json.load(f)
+                key = (str(state.get("rank")), str(state.get("worker")))
+                current = latest_by_worker.get(key)
+                if current is None or str(state.get("time", "")) > str(current.get("time", "")):
+                    latest_by_worker[key] = state
+            except Exception as exc:
+                print(f"[DataLoader debug] failed to read {path}: {exc}", flush=True)
+
+        states = sorted(
+            latest_by_worker.values(),
+            key=lambda state: (str(state.get("rank")), str(state.get("worker"))),
+        )
+        print(
+            f"[DataLoader debug] latest worker states from {state_dir} "
+            f"({len(states)} current, {len(state_files)} files):",
+            flush=True,
+        )
+        for state in states:
+            try:
                 views = state.get("views", {})
                 view_text = "; ".join(
                     f"{key}: {value.get('video_path')} frames={value.get('frame_indices')}"
@@ -499,6 +517,45 @@ class Trainer:
             except Exception as exc:
                 print(f"[DataLoader debug] failed to read {path}: {exc}", flush=True)
 
+    def _find_latest_checkpoint(self, project_dir: str) -> str | None:
+        if not os.path.isdir(project_dir):
+            return None
+
+        checkpoints = []
+        for name in os.listdir(project_dir):
+            ckpt_dir = os.path.join(project_dir, name)
+            if not name.startswith("checkpoint-") or not os.path.isdir(ckpt_dir):
+                continue
+            try:
+                step_num = int(name.split("-")[1])
+            except (IndexError, ValueError):
+                continue
+            checkpoints.append((step_num, ckpt_dir))
+        if not checkpoints:
+            return None
+
+        for _, ckpt_dir in sorted(checkpoints, reverse=True):
+            model_path = os.path.join(ckpt_dir, "model.pt")
+            state_path = os.path.join(ckpt_dir, "training_state.pt")
+            full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
+            if os.path.exists(state_path) and (os.path.exists(model_path) or os.path.isdir(full_state_dir)):
+                return ckpt_dir
+            if self.process_index == 0:
+                print(f"[WARN] Skipping incomplete checkpoint: {ckpt_dir}", flush=True)
+        return None
+
+    def _load_raw_model_checkpoint(self, model_path: str) -> None:
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+        state_dict = self._extract_model_state(state_dict)
+        target = self.accelerator.unwrap_model(self.model) if hasattr(self.model, "module") else self.model
+        missing, unexpected = target.load_state_dict(state_dict, strict=False)
+        if self.process_index == 0:
+            print(f"Loaded raw model checkpoint from {model_path}")
+            if missing:
+                print(f"  Missing keys ({len(missing)}): {missing[:5]}...")
+            if unexpected:
+                print(f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+
     def run(self):
         project_dir = self.config.get("project_dir", "./output")
         os.makedirs(project_dir, exist_ok=True)
@@ -506,6 +563,18 @@ class Trainer:
 
         model_config = DictConfig(self.config["models"])
         self.model = self.get_models(model_config)
+
+        resume_ckpt_dir = None
+        resume_raw_preloaded = False
+        if train_cfg.get("resume", False):
+            resume_ckpt_dir = self._find_latest_checkpoint(project_dir)
+            if resume_ckpt_dir is not None:
+                full_state_dir = os.path.join(resume_ckpt_dir, "accelerator_state")
+                model_path = os.path.join(resume_ckpt_dir, "model.pt")
+                if not os.path.isdir(full_state_dir) and os.path.exists(model_path):
+                    # Raw checkpoints must be loaded before DeepSpeed shards the model.
+                    self._load_raw_model_checkpoint(model_path)
+                    resume_raw_preloaded = True
 
         dataset = self._build_dataset()
         dataloader = self._build_dataloader(dataset)
@@ -591,11 +660,18 @@ class Trainer:
 
         if train_cfg.get("resume", False):
             self._resume_restored_scheduler = False
-            self.cur_step = self._try_resume(project_dir, ema, optimizer, scheduler)
+            self.cur_step = self._try_resume(
+                project_dir,
+                ema,
+                optimizer,
+                scheduler,
+                ckpt_dir=resume_ckpt_dir,
+                raw_model_preloaded=resume_raw_preloaded,
+            )
             if self.cur_step:
                 if not getattr(self, "_resume_restored_scheduler", False):
-                    # Legacy checkpoints store model/EMA/step, but not scheduler state.
-                    # Fast-forward the LR scheduler so resumed runs keep the original LR curve.
+                    # Raw checkpoints store model/EMA/step but not optimizer state.
+                    # Fast-forward the fresh scheduler so LR stays on the original curve.
                     for _ in range(self.cur_step):
                         scheduler.step()
                     if self.process_index == 0:
@@ -835,38 +911,14 @@ class Trainer:
         ema: EMA | None = None,
         optimizer: torch.optim.Optimizer | None = None,
         scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+        *,
+        ckpt_dir: str | None = None,
+        raw_model_preloaded: bool = False,
     ) -> int:
-        if not os.path.isdir(project_dir):
+        if ckpt_dir is None:
+            ckpt_dir = self._find_latest_checkpoint(project_dir)
+        if ckpt_dir is None:
             return 0
-
-        checkpoints = []
-        for name in os.listdir(project_dir):
-            ckpt_dir = os.path.join(project_dir, name)
-            if not name.startswith("checkpoint-") or not os.path.isdir(ckpt_dir):
-                continue
-            try:
-                step_num = int(name.split("-")[1])
-            except (IndexError, ValueError):
-                continue
-            checkpoints.append((step_num, name))
-        if not checkpoints:
-            return 0
-
-        latest = None
-        for _, name in sorted(checkpoints, reverse=True):
-            ckpt_dir = os.path.join(project_dir, name)
-            model_path = os.path.join(ckpt_dir, "model.pt")
-            state_path = os.path.join(ckpt_dir, "training_state.pt")
-            full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
-            if os.path.exists(state_path) and (os.path.exists(model_path) or os.path.isdir(full_state_dir)):
-                latest = name
-                break
-            if self.process_index == 0:
-                print(f"[WARN] Skipping incomplete checkpoint: {ckpt_dir}", flush=True)
-        if latest is None:
-            return 0
-
-        ckpt_dir = os.path.join(project_dir, latest)
 
         full_state_dir = os.path.join(ckpt_dir, "accelerator_state")
         full_state_loaded = False
@@ -883,19 +935,28 @@ class Trainer:
             )
 
         model_path = os.path.join(ckpt_dir, "model.pt")
-        if not full_state_loaded and os.path.exists(model_path):
-            state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
-            state_dict = self._extract_model_state(state_dict)
-            unwrapped = self.accelerator.unwrap_model(self.model)
-            unwrapped.load_state_dict(state_dict, strict=False)
+        if not full_state_loaded and not raw_model_preloaded and os.path.exists(model_path):
+            if self.process_index == 0:
+                print(
+                    "[WARN] Raw model checkpoint was not preloaded before DeepSpeed prepare; "
+                    "loading it into the prepared model as a fallback.",
+                    flush=True,
+                )
+            self._load_raw_model_checkpoint(model_path)
 
         scheduler_path = os.path.join(ckpt_dir, "scheduler.pt")
-        if scheduler is not None and os.path.exists(scheduler_path):
+        if scheduler is not None and os.path.exists(scheduler_path) and full_state_loaded:
             scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
             scheduler.load_state_dict(scheduler_state)
             self._resume_restored_scheduler = True
             if self.process_index == 0:
                 print(f"Loaded scheduler state from {scheduler_path}")
+        elif scheduler is not None and os.path.exists(scheduler_path) and self.process_index == 0:
+            print(
+                f"Found scheduler state at {scheduler_path}, but raw resume has a fresh optimizer; "
+                "will fast-forward scheduler instead.",
+                flush=True,
+            )
 
         step = 0
         state_path = os.path.join(ckpt_dir, "training_state.pt")

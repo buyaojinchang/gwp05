@@ -208,7 +208,13 @@ class LeRobotDataset(Dataset):
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         if self.video_backend == "decord":
-            return self._read_frames_decord(video_path, frame_indices)
+            try:
+                return self._read_frames_decord(video_path, frame_indices)
+            except ImportError as exc:
+                raise ImportError(
+                    "video_backend=decord requires the decord package. "
+                    "Install decord or set dataset.video_backend=pyav."
+                ) from exc
         return self._read_frames_pyav(video_path, frame_indices)
 
     @staticmethod
